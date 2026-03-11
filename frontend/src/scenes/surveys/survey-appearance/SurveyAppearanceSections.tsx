@@ -1,0 +1,337 @@
+import { useValues } from 'kea'
+import { DeepPartialMap, ValidationErrorType } from 'kea-forms'
+
+import { IconCheck } from '@posthog/icons'
+import { LemonButton, LemonInput, LemonSelect } from '@posthog/lemon-ui'
+
+import { RestrictionScope, useRestrictedArea } from 'lib/components/RestrictedArea'
+import { TeamMembershipLevel } from 'lib/constants'
+import { LemonField } from 'lib/lemon-ui/LemonField'
+import { WEB_SAFE_FONTS } from 'scenes/surveys/constants'
+import { surveysLogic } from 'scenes/surveys/surveysLogic'
+
+import { SurveyAppearance, SurveyPosition, SurveyType, SurveyWidgetType } from '~/types'
+
+import { SurveyPositionSelector } from './SurveyAppearancePositionSelector'
+
+interface CommonProps {
+    appearance: SurveyAppearance
+    onAppearanceChange: (appearance: SurveyAppearance) => void
+    validationErrors?: DeepPartialMap<SurveyAppearance, ValidationErrorType> | null
+    surveyType?: SurveyType
+}
+
+const gridPositions: SurveyPosition[] = [
+    SurveyPosition.TopLeft,
+    SurveyPosition.TopCenter,
+    SurveyPosition.TopRight,
+    SurveyPosition.MiddleLeft,
+    SurveyPosition.MiddleCenter,
+    SurveyPosition.MiddleRight,
+    SurveyPosition.Left,
+    SurveyPosition.Center,
+    SurveyPosition.Right,
+    // Bottom positions are not in the current enum, will add if they become available
+    // SurveyPosition.BottomLeft, SurveyPosition.BottomCenter, SurveyPosition.BottomRight
+]
+
+const positionDisplayNames: Record<SurveyPosition, string> = {
+    [SurveyPosition.TopLeft]: 'Top Left',
+    [SurveyPosition.TopCenter]: 'Top Center',
+    [SurveyPosition.TopRight]: 'Top Right',
+    [SurveyPosition.MiddleLeft]: 'Middle Left',
+    [SurveyPosition.MiddleCenter]: 'Middle Center',
+    [SurveyPosition.MiddleRight]: 'Middle Right',
+    [SurveyPosition.Left]: 'Bottom Left',
+    [SurveyPosition.Center]: 'Bottom Center',
+    [SurveyPosition.Right]: 'Bottom Right',
+    [SurveyPosition.NextToTrigger]: 'Next to feedback button',
+}
+
+const IGNORE_ERROR_BORDER_CLASS = 'ignore-error-border'
+
+function SurveyOptionsGroup({
+    children,
+    sectionTitle,
+}: {
+    children: React.ReactNode
+    sectionTitle: string
+}): JSX.Element {
+    return (
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 items-start">
+            <h3 className="col-span-full mb-0">{sectionTitle}</h3>
+            {children}
+        </div>
+    )
+}
+
+interface SurveyAppearanceInputProps {
+    value?: string
+    onChange: (value: string) => void
+    error?: string
+    label: string
+    info?: string
+    placeholder?: string
+    disabledReason?: string | null
+}
+
+function SurveyAppearanceInput({
+    value,
+    onChange,
+    error,
+    label,
+    info,
+    placeholder,
+    disabledReason,
+}: SurveyAppearanceInputProps): JSX.Element {
+    const { surveysStylingAvailable } = useValues(surveysLogic)
+
+    return (
+        <LemonField.Pure label={label} className="flex-1 gap-1" info={info}>
+            <LemonInput
+                value={value}
+                onChange={onChange}
+                disabled={!surveysStylingAvailable}
+                className={IGNORE_ERROR_BORDER_CLASS}
+                placeholder={placeholder}
+                disabledReason={disabledReason}
+            />
+            {error && <LemonField.Error error={error} />}
+        </LemonField.Pure>
+    )
+}
+
+export function SurveyContainerAppearance({
+    appearance,
+    onAppearanceChange,
+    validationErrors,
+    surveyType,
+}: CommonProps): JSX.Element | null {
+    const { surveysStylingAvailable } = useValues(surveysLogic)
+    const restrictedReason = useRestrictedArea({
+        scope: RestrictionScope.Project,
+        minimumAccessLevel: TeamMembershipLevel.Admin,
+    })
+
+    return (
+        <SurveyOptionsGroup sectionTitle="Container options">
+            <span className="col-span-full text-secondary">
+                These options are only applied in the web surveys. Not on native mobile apps.
+            </span>
+            <SurveyAppearanceInput
+                value={appearance.maxWidth}
+                onChange={(maxWidth) => onAppearanceChange({ maxWidth })}
+                error={validationErrors?.maxWidth}
+                disabledReason={restrictedReason}
+                label="Survey width"
+                info="Min-width is always set to 300px"
+            />
+            <SurveyAppearanceInput
+                value={appearance.boxPadding}
+                onChange={(boxPadding) => onAppearanceChange({ boxPadding })}
+                error={validationErrors?.boxPadding}
+                disabledReason={restrictedReason}
+                label="Box padding"
+            />
+            <SurveyAppearanceInput
+                value={appearance.boxShadow}
+                onChange={(boxShadow) => onAppearanceChange({ boxShadow })}
+                error={validationErrors?.boxShadow}
+                disabledReason={restrictedReason}
+                label="Box shadow"
+            />
+            <SurveyAppearanceInput
+                value={appearance.borderRadius}
+                onChange={(borderRadius) => onAppearanceChange({ borderRadius })}
+                error={validationErrors?.borderRadius}
+                disabledReason={restrictedReason}
+                label="Border radius"
+            />
+            <LemonField.Pure
+                label="Position"
+                info={
+                    surveyType === SurveyType.Widget && appearance.widgetType === SurveyWidgetType.Selector
+                        ? 'The "next to feedback button" option requires posthog.js version 1.235.2 or higher.'
+                        : undefined
+                }
+                className="gap-1 col-span-full"
+            >
+                <div className="flex items-center gap-2">
+                    <SurveyPositionSelector
+                        currentPosition={appearance.position}
+                        onAppearanceChange={onAppearanceChange}
+                        disabled={!surveysStylingAvailable || !!restrictedReason}
+                    />
+                    <LemonSelect
+                        value={appearance.position}
+                        onChange={(position) => onAppearanceChange({ position })}
+                        options={gridPositions.map((position) => ({
+                            label: positionDisplayNames[position],
+                            value: position,
+                        }))}
+                        disabled={!surveysStylingAvailable}
+                        disabledReason={restrictedReason}
+                    />
+                </div>
+                {surveyType === SurveyType.Widget && appearance.widgetType === SurveyWidgetType.Selector && (
+                    <div className="flex flex-col gap-1 items-start w-60">
+                        <LemonButton
+                            key={SurveyPosition.NextToTrigger}
+                            type="tertiary"
+                            size="small"
+                            fullWidth
+                            onClick={() =>
+                                onAppearanceChange({ ...appearance, position: SurveyPosition.NextToTrigger })
+                            }
+                            active={appearance.position === SurveyPosition.NextToTrigger}
+                            disabled={!surveysStylingAvailable}
+                            disabledReason={restrictedReason}
+                        >
+                            {positionDisplayNames[SurveyPosition.NextToTrigger]}
+                            {appearance.position === SurveyPosition.NextToTrigger && (
+                                <IconCheck className="ml-2 size-4" />
+                            )}
+                        </LemonButton>
+                    </div>
+                )}
+            </LemonField.Pure>
+            <LemonField.Pure
+                label="Font family"
+                info="Custom font selection requires at least version 1.223.4 of posthog-js"
+                className="gap-1"
+            >
+                <LemonSelect
+                    value={appearance?.fontFamily}
+                    onChange={(fontFamily) => onAppearanceChange({ fontFamily })}
+                    options={WEB_SAFE_FONTS.map((font) => {
+                        return {
+                            label: <span className={font.value.toLowerCase().replace(/\s/g, '-')}>{font.label}</span>,
+                            value: font.value,
+                        }
+                    })}
+                    className="ignore-error-border"
+                    disabled={!surveysStylingAvailable}
+                    disabledReason={restrictedReason}
+                />
+            </LemonField.Pure>
+            <SurveyAppearanceInput
+                value={appearance.zIndex}
+                onChange={(zIndex) => onAppearanceChange({ zIndex })}
+                error={validationErrors?.zIndex}
+                disabledReason={restrictedReason}
+                label="Survey form zIndex"
+                info="If the survey popup is hidden, set this value higher than the overlapping element's zIndex."
+            />
+        </SurveyOptionsGroup>
+    )
+}
+
+function SurveyColorsSubgroup({ children, title }: { children: React.ReactNode; title: string }): JSX.Element {
+    return (
+        <div className="col-span-full grid grid-cols-1 sm:grid-cols-3 gap-2">
+            <span className="col-span-full text-xs font-semibold text-secondary uppercase tracking-wide">{title}</span>
+            {children}
+        </div>
+    )
+}
+
+export function SurveyColorsAppearance({
+    appearance,
+    onAppearanceChange,
+    validationErrors,
+    customizeRatingButtons,
+    customizePlaceholderText,
+}: CommonProps & {
+    customizeRatingButtons: boolean
+    customizePlaceholderText: boolean
+}): JSX.Element {
+    const restrictedReason = useRestrictedArea({
+        scope: RestrictionScope.Project,
+        minimumAccessLevel: TeamMembershipLevel.Admin,
+    })
+
+    return (
+        <SurveyOptionsGroup sectionTitle="Colors and placeholder customization">
+            <SurveyColorsSubgroup title="Survey background">
+                <SurveyAppearanceInput
+                    value={appearance.backgroundColor}
+                    onChange={(backgroundColor) => onAppearanceChange({ backgroundColor })}
+                    error={validationErrors?.backgroundColor}
+                    disabledReason={restrictedReason}
+                    label="Background color"
+                />
+                <SurveyAppearanceInput
+                    value={appearance.textColor}
+                    onChange={(textColor) => onAppearanceChange({ textColor })}
+                    error={validationErrors?.textColor}
+                    disabledReason={restrictedReason}
+                    label="Text color"
+                    placeholder="Leave empty for auto-contrast"
+                />
+                <SurveyAppearanceInput
+                    value={appearance.borderColor}
+                    onChange={(borderColor) => onAppearanceChange({ borderColor })}
+                    error={validationErrors?.borderColor}
+                    disabledReason={restrictedReason}
+                    label="Border color"
+                />
+            </SurveyColorsSubgroup>
+
+            <SurveyColorsSubgroup title="Inputs and ratings">
+                <SurveyAppearanceInput
+                    value={appearance.inputBackground}
+                    onChange={(inputBackground) =>
+                        onAppearanceChange({ inputBackground, ratingButtonColor: inputBackground })
+                    }
+                    error={validationErrors?.inputBackground || validationErrors?.ratingButtonColor}
+                    disabledReason={restrictedReason}
+                    label="Background color"
+                />
+                <SurveyAppearanceInput
+                    value={appearance.inputTextColor}
+                    onChange={(inputTextColor) => onAppearanceChange({ inputTextColor })}
+                    error={validationErrors?.inputTextColor}
+                    disabledReason={restrictedReason}
+                    label="Text color"
+                    placeholder="Leave empty for auto-contrast"
+                />
+                {customizeRatingButtons && (
+                    <SurveyAppearanceInput
+                        value={appearance.ratingButtonActiveColor}
+                        onChange={(ratingButtonActiveColor) => onAppearanceChange({ ratingButtonActiveColor })}
+                        error={validationErrors?.ratingButtonActiveColor}
+                        disabledReason={restrictedReason}
+                        label="Active rating background"
+                    />
+                )}
+                {customizePlaceholderText && (
+                    <SurveyAppearanceInput
+                        value={appearance.placeholder}
+                        onChange={(placeholder) => onAppearanceChange({ placeholder })}
+                        error={validationErrors?.placeholder}
+                        disabledReason={restrictedReason}
+                        label="Placeholder text"
+                    />
+                )}
+            </SurveyColorsSubgroup>
+
+            <SurveyColorsSubgroup title="Submit button">
+                <SurveyAppearanceInput
+                    value={appearance.submitButtonColor}
+                    onChange={(submitButtonColor) => onAppearanceChange({ submitButtonColor })}
+                    error={validationErrors?.submitButtonColor}
+                    disabledReason={restrictedReason}
+                    label="Background color"
+                />
+                <SurveyAppearanceInput
+                    value={appearance.submitButtonTextColor}
+                    onChange={(submitButtonTextColor) => onAppearanceChange({ submitButtonTextColor })}
+                    error={validationErrors?.submitButtonTextColor}
+                    disabledReason={restrictedReason}
+                    label="Text color"
+                    placeholder="Leave empty for auto-contrast"
+                />
+            </SurveyColorsSubgroup>
+        </SurveyOptionsGroup>
+    )
+}

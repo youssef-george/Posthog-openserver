@@ -1,0 +1,2221 @@
+use crate::api::errors::FlagError;
+use crate::api::types::{FlagDetails, FlagValue, FlagsResponse, FromFeatureAndMatch};
+use crate::cohorts::cohort_cache_manager::CohortCacheManager;
+use crate::cohorts::cohort_models::{Cohort, CohortId};
+use crate::cohorts::cohort_operations::{apply_cohort_membership_logic, evaluate_dynamic_cohorts};
+use crate::database::PostgresRouter;
+use crate::flags::flag_group_type_mapping::{GroupTypeIndex, GroupTypeMappingCache};
+use crate::flags::flag_match_reason::FeatureFlagMatchReason;
+use crate::flags::flag_matching_utils::{
+    all_flag_condition_properties_match, all_properties_match, calculate_hash,
+    fetch_and_locally_cache_all_relevant_properties, get_feature_flag_hash_key_overrides,
+    populate_missing_initial_properties, set_feature_flag_hash_key_overrides,
+    should_write_hash_key_override,
+};
+use crate::flags::flag_models::{
+    FeatureFlag, FeatureFlagId, FeatureFlagList, FlagFilters, FlagPropertyGroup,
+};
+use crate::flags::flag_operations::flags_require_db_preparation;
+use crate::handler::canonical_log::{install_rayon_canonical_log, take_rayon_canonical_log};
+use crate::handler::with_canonical_log;
+use crate::metrics::consts::{
+    DB_PERSON_AND_GROUP_PROPERTIES_READS_COUNTER, FLAG_BATCH_EVALUATION_COUNTER,
+    FLAG_BATCH_EVALUATION_TIME, FLAG_BATCH_SIZE, FLAG_DB_PROPERTIES_FETCH_TIME,
+    FLAG_EVALUATE_ALL_CONDITIONS_TIME, FLAG_EVALUATION_ERROR_COUNTER, FLAG_EVALUATION_TIME,
+    FLAG_EXPERIENCE_CONTINUITY_OPTIMIZED, FLAG_EXPERIENCE_CONTINUITY_REQUESTS_COUNTER,
+    FLAG_GET_MATCH_TIME, FLAG_GROUP_CACHE_FETCH_TIME, FLAG_GROUP_DB_FETCH_TIME,
+    FLAG_HASH_KEY_PROCESSING_TIME, FLAG_HASH_KEY_WRITES_COUNTER, PROPERTY_CACHE_HITS_COUNTER,
+    PROPERTY_CACHE_MISSES_COUNTER,
+};
+use crate::properties::property_models::PropertyFilter;
+use crate::rayon_dispatcher::RayonDispatcher;
+use crate::utils::graph_utils::{
+    build_dependency_graph, filter_graph_by_keys, log_dependency_graph_operation_error,
+    DependencyGraph, DependencyGraphResult, FilteredGraphResult,
+};
+use anyhow::Result;
+use common_metrics::{histogram, inc, timing_guard};
+use common_types::collections::HashMapExt;
+use common_types::{PersonId, TeamId};
+use rayon::prelude::*;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tracing::{error, instrument, warn};
+use uuid::Uuid;
+
+const DEFAULT_PARALLEL_EVAL_THRESHOLD: usize = 100;
+
+/// Parameters for feature flag evaluation with various override options
+#[derive(Debug, Default)]
+pub struct FlagEvaluationOverrides {
+    pub person_property_overrides: Option<HashMap<String, Value>>,
+    pub group_property_overrides: Option<HashMap<String, HashMap<String, Value>>>,
+    pub hash_key_overrides: Option<HashMap<String, String>>,
+    pub hash_key_override_error: bool,
+    /// The request's anon_distinct_id, used as a fallback for EEC flags when no DB override exists
+    pub request_hash_key_override: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvaluationType {
+    Sequential,
+    Parallel,
+}
+
+impl EvaluationType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EvaluationType::Sequential => "sequential",
+            EvaluationType::Parallel => "parallel",
+        }
+    }
+
+    /// Promote evaluation type across dependency levels:
+    /// None → Sequential, None → Parallel, Sequential → Parallel.
+    /// Parallel is sticky — once set, it never demotes back to Sequential.
+    pub fn promote(current: Option<Self>, level_type: Self) -> Option<Self> {
+        match (current, level_type) {
+            (_, Self::Parallel) => Some(Self::Parallel),
+            (None, Self::Sequential) => Some(Self::Sequential),
+            (current, Self::Sequential) => current,
+        }
+    }
+}
+
+impl std::fmt::Display for EvaluationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug)]
+struct SuperConditionEvaluation {
+    should_evaluate: bool,
+    is_match: bool,
+    reason: FeatureFlagMatchReason,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct FeatureFlagMatch {
+    pub matches: bool,
+    pub variant: Option<String>,
+    pub reason: FeatureFlagMatchReason,
+    pub condition_index: Option<usize>,
+    pub payload: Option<Value>,
+}
+
+impl FeatureFlagMatch {
+    pub fn get_flag_value(&self) -> FlagValue {
+        match (self.matches, &self.variant) {
+            (true, Some(variant)) => FlagValue::String(variant.clone()),
+            (true, None) => FlagValue::Boolean(true),
+            (false, _) => FlagValue::Boolean(false),
+        }
+    }
+
+    /// Creates a match result for flags with missing dependencies.
+    /// These flags evaluate to `false` (fail closed) with the `MissingDependency` reason.
+    pub fn missing_dependency() -> Self {
+        Self {
+            matches: false,
+            variant: None,
+            reason: FeatureFlagMatchReason::MissingDependency,
+            condition_index: None,
+            payload: None,
+        }
+    }
+}
+
+/// This struct maintains evaluation state by caching database-sourced data during feature flag evaluation.
+/// It stores person IDs, properties, group properties, and cohort matches that are fetched from the database,
+/// allowing them to be reused across multiple flag evaluations within the same request without additional DB lookups.
+///
+/// The cache is scoped to a single evaluation session and is cleared between different requests.
+#[derive(Clone, Default, Debug)]
+pub struct FlagEvaluationState {
+    /// The person ID associated with the distinct_id being evaluated
+    person_id: Option<PersonId>,
+    /// Properties associated with the person, fetched from the database
+    pub(crate) person_properties: Option<HashMap<String, Value>>,
+    /// Properties for each group type involved in flag evaluation
+    group_properties: HashMap<GroupTypeIndex, HashMap<String, Value>>,
+    /// Cohorts for the current request
+    cohorts: Option<Vec<Cohort>>,
+    /// Cache of static cohort membership results to avoid repeated DB lookups
+    static_cohort_matches: Option<HashMap<CohortId, bool>>,
+    /// Cache of flag evaluation results to avoid repeated DB lookups
+    flag_evaluation_results: HashMap<FeatureFlagId, FlagValue>,
+}
+
+impl FlagEvaluationState {
+    pub fn get_person_id(&self) -> Option<PersonId> {
+        self.person_id
+    }
+
+    pub fn get_person_properties(&self) -> Option<&HashMap<String, Value>> {
+        self.person_properties.as_ref()
+    }
+
+    pub fn get_group_properties(&self) -> &HashMap<GroupTypeIndex, HashMap<String, Value>> {
+        &self.group_properties
+    }
+
+    pub fn get_static_cohort_matches(&self) -> Option<&HashMap<CohortId, bool>> {
+        self.static_cohort_matches.as_ref()
+    }
+
+    pub fn set_person_id(&mut self, id: PersonId) {
+        self.person_id = Some(id);
+    }
+
+    pub fn set_person_properties(&mut self, properties: HashMap<String, Value>) {
+        self.person_properties = Some(properties);
+    }
+
+    pub fn set_cohorts(&mut self, cohorts: Vec<Cohort>) {
+        self.cohorts = Some(cohorts);
+    }
+
+    pub fn set_group_properties(
+        &mut self,
+        group_type_index: GroupTypeIndex,
+        properties: HashMap<String, Value>,
+    ) {
+        self.group_properties.insert(group_type_index, properties);
+    }
+
+    pub fn set_static_cohort_matches(&mut self, matches: HashMap<CohortId, bool>) {
+        self.static_cohort_matches = Some(matches);
+    }
+
+    pub fn add_flag_evaluation_result(&mut self, flag_id: FeatureFlagId, flag_value: FlagValue) {
+        self.flag_evaluation_results.insert(flag_id, flag_value);
+    }
+}
+
+/// Represents the group-related data needed for feature flag evaluation
+#[derive(Debug)]
+struct GroupEvaluationData {
+    /// Set of group type indexes required for flag evaluation
+    type_indexes: HashSet<GroupTypeIndex>,
+    /// Set of group keys that need to be evaluated
+    keys: HashSet<String>,
+}
+
+/// Evaluates feature flags for a specific user/group context.
+///
+/// This struct maintains the state and logic needed to evaluate feature flags, including:
+/// - User identification (distinct_id, team_id)
+/// - Database connections for fetching data
+/// - Caches for properties, cohorts, and group mappings to optimize performance
+/// - Evaluation state that persists across multiple flag evaluations in a request
+///
+/// The matcher is typically created once per request and can evaluate multiple flags
+/// efficiently by reusing cached data and DB connections.
+#[derive(Clone)]
+pub struct FeatureFlagMatcher {
+    /// Unique identifier for the user/entity being evaluated
+    pub distinct_id: String,
+    /// Optional device identifier for device-level bucketing
+    pub device_id: Option<String>,
+    /// Team ID for scoping flag evaluations
+    pub team_id: TeamId,
+    /// Router for database connections across persons/non-persons pools
+    pub router: PostgresRouter,
+    /// Cache manager for cohort definitions and memberships
+    pub cohort_cache: Arc<CohortCacheManager>,
+    /// Cache for mapping between group types and their indices
+    group_type_mapping_cache: GroupTypeMappingCache,
+    /// State maintained during flag evaluation, including cached DB lookups
+    pub(crate) flag_evaluation_state: FlagEvaluationState,
+    /// Group key mappings for group-based flag evaluation
+    /// Maps group type name to the group key (identifier customer supplies for the group)
+    /// ex. "project" → "123"
+    ///     "organization" → "456"
+    ///     "instance" → "789"
+    ///     "customer" → "101"
+    ///     "team" → "112"
+    groups: HashMap<String, Value>,
+    /// Flag count threshold for switching from sequential to parallel evaluation.
+    /// Configured via PARALLEL_EVAL_THRESHOLD env var in production.
+    parallel_eval_threshold: usize,
+    /// Dispatcher for bounded-concurrency Rayon batch evaluation.
+    /// `None` in tests that don't exercise the parallel path.
+    rayon_dispatcher: Option<RayonDispatcher>,
+    /// When true, skip all writes to PostgreSQL and Redis.
+    skip_writes: bool,
+    /// Flag IDs that should be skipped during evaluation.
+    /// Populated once per request from `FeatureFlagList::filtered_out_flag_ids`.
+    pub(crate) filtered_out_flag_ids: HashSet<i32>,
+}
+
+/// Lightweight snapshot of a flag's identity fields, saved before moving
+/// flags into the Rayon pool. Used to reconstruct per-flag error results
+/// if the rayon task panics.
+struct FlagSnapshot {
+    key: String,
+    id: FeatureFlagId,
+    version: Option<i32>,
+}
+
+impl FlagSnapshot {
+    pub fn from_flag(flag: &FeatureFlag) -> Self {
+        FlagSnapshot {
+            key: flag.key.clone(),
+            id: flag.id,
+            version: flag.version,
+        }
+    }
+}
+
+impl FeatureFlagMatcher {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        distinct_id: String,
+        device_id: Option<String>,
+        team_id: TeamId,
+        router: PostgresRouter,
+        cohort_cache: Arc<CohortCacheManager>,
+        group_type_mapping_cache: Option<GroupTypeMappingCache>,
+        groups: Option<HashMap<String, Value>>,
+    ) -> Self {
+        FeatureFlagMatcher {
+            distinct_id,
+            device_id,
+            team_id,
+            router,
+            cohort_cache,
+            group_type_mapping_cache: group_type_mapping_cache
+                .unwrap_or_else(|| GroupTypeMappingCache::new(team_id)),
+            groups: groups.unwrap_or_default(),
+            flag_evaluation_state: FlagEvaluationState::default(),
+            parallel_eval_threshold: DEFAULT_PARALLEL_EVAL_THRESHOLD,
+            rayon_dispatcher: None,
+            skip_writes: false,
+            filtered_out_flag_ids: HashSet::new(),
+        }
+    }
+
+    pub fn with_parallel_eval_threshold(mut self, threshold: usize) -> Self {
+        self.parallel_eval_threshold = threshold;
+        self
+    }
+
+    pub fn with_rayon_dispatcher(mut self, dispatcher: RayonDispatcher) -> Self {
+        self.rayon_dispatcher = Some(dispatcher);
+        self
+    }
+
+    pub fn with_skip_writes(mut self, skip_writes: bool) -> Self {
+        self.skip_writes = skip_writes;
+        self
+    }
+
+    /// Evaluates all feature flags for the current matcher context.
+    ///
+    /// ## Arguments
+    ///
+    /// * `feature_flags` - The list of feature flags to evaluate.
+    /// * `person_property_overrides` - Any overrides for person properties.
+    /// * `group_property_overrides` - Any overrides for group properties.
+    /// * `hash_key_override` - Optional hash key overrides for experience continuity.
+    /// * `optimize_experience_continuity_lookups` - When true, skip lookups for flags that don't need them.
+    ///
+    /// ## Returns
+    ///
+    /// * `FlagsResponse` - The result containing flag evaluations and any errors.
+    #[instrument(skip_all, fields(team_id = %self.team_id, distinct_id = %self.distinct_id, flags_len = feature_flags.flags.len()))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn evaluate_all_feature_flags(
+        &mut self,
+        feature_flags: FeatureFlagList,
+        person_property_overrides: Option<HashMap<String, Value>>,
+        group_property_overrides: Option<HashMap<String, HashMap<String, Value>>>,
+        hash_key_override: Option<String>, // Aka $anon_distinct_id
+        request_id: Uuid,
+        flag_keys: Option<Vec<String>>,
+        optimize_experience_continuity_lookups: bool,
+    ) -> Result<FlagsResponse, FlagError> {
+        let eval_timer = common_metrics::timing_guard(FLAG_EVALUATION_TIME, &[]);
+
+        // Build dependency graph once - reused for both optimization check and evaluation
+        let DependencyGraphResult {
+            graph: global_dependency_graph,
+            errors: graph_errors,
+            flags_with_missing_deps: global_flags_with_missing_deps,
+        } = match build_dependency_graph(&feature_flags, self.team_id) {
+            Some(result) => result,
+            None => return Ok(FlagsResponse::new(true, HashMap::new(), None, request_id)),
+        };
+
+        // Move the filter set onto the matcher now that the borrow from graph construction has ended.
+        // This is the single source of truth for "should this flag be skipped" during evaluation.
+        self.filtered_out_flag_ids = feature_flags.filtered_out_flag_ids;
+
+        // Filter graph by flag_keys if specified (includes transitive dependencies)
+        let (dependency_graph, flags_with_missing_deps) = if let Some(ref keys) = flag_keys {
+            match filter_graph_by_keys(
+                &global_dependency_graph,
+                keys,
+                &global_flags_with_missing_deps,
+            ) {
+                Some(FilteredGraphResult {
+                    graph,
+                    flags_with_missing_deps,
+                }) => (graph, flags_with_missing_deps),
+                None => return Ok(FlagsResponse::new(true, HashMap::new(), None, request_id)),
+            }
+        } else {
+            (global_dependency_graph, global_flags_with_missing_deps)
+        };
+
+        if !graph_errors.is_empty() {
+            with_canonical_log(|log| log.dependency_graph_errors = graph_errors.len());
+        }
+
+        // Compute experience continuity stats from the filtered graph.
+        // This considers all flags that will actually be evaluated (including dependencies).
+        let (experience_continuity_count, any_flag_needs_override) = {
+            let mut continuity_count = 0;
+            let mut needs_override = false;
+
+            for flag in dependency_graph.iter_nodes() {
+                if !self.filtered_out_flag_ids.contains(&flag.id)
+                    && flag.has_experience_continuity()
+                {
+                    continuity_count += 1;
+                    if !needs_override && flag.needs_hash_key_override() {
+                        needs_override = true;
+                    }
+                }
+            }
+
+            (continuity_count, needs_override)
+        };
+
+        // Log the experience continuity count from the filtered graph
+        with_canonical_log(|log| log.flags_experience_continuity = experience_continuity_count);
+
+        let has_experience_continuity = experience_continuity_count > 0;
+
+        // Determine if we need to do the hash key override lookup.
+        // In legacy mode (optimization disabled), we always do the lookup if any flag has continuity.
+        // In optimized mode, we only do it if any flag actually needs it.
+        let do_hash_key_lookup = if optimize_experience_continuity_lookups {
+            any_flag_needs_override
+        } else {
+            has_experience_continuity
+        };
+
+        // A request is optimizable when it has experience continuity flags but none require the lookup
+        let request_is_optimizable = has_experience_continuity && !any_flag_needs_override;
+
+        // Track optimization metric: status="skipped" when we skip, "eligible" when we could have
+        if request_is_optimizable {
+            let status = if optimize_experience_continuity_lookups {
+                "skipped"
+            } else {
+                "eligible"
+            };
+
+            inc(
+                FLAG_EXPERIENCE_CONTINUITY_OPTIMIZED,
+                &[
+                    ("status".to_string(), status.to_string()),
+                    ("team_id".to_string(), self.team_id.to_string()),
+                ],
+                1,
+            );
+        }
+
+        // Record when the optimization actually skips the lookup
+        if request_is_optimizable && optimize_experience_continuity_lookups {
+            with_canonical_log(|log| log.hash_key_override_status = Some("skipped"));
+        }
+
+        // Clone the request's hash_key_override before passing it to process_hash_key_override_if_needed
+        // since we also need it for the FlagEvaluationOverrides struct
+        let request_hash_key_override = hash_key_override.clone();
+
+        // Process any hash key overrides
+        let (hash_key_overrides, flag_hash_key_override_error) = self
+            .process_hash_key_override_if_needed(do_hash_key_lookup, hash_key_override)
+            .await;
+
+        let overrides = FlagEvaluationOverrides {
+            person_property_overrides,
+            group_property_overrides,
+            hash_key_overrides,
+            hash_key_override_error: flag_hash_key_override_error,
+            request_hash_key_override,
+        };
+
+        // Pass the pre-built graph to avoid redundant graph construction
+        let flags_response = self
+            .evaluate_flags_with_overrides(
+                overrides,
+                request_id,
+                dependency_graph,
+                flags_with_missing_deps,
+            )
+            .await?;
+
+        let has_cycle_errors = graph_errors.iter().any(|e| e.is_cycle());
+        let has_errors = flag_hash_key_override_error
+            || flags_response.errors_while_computing_flags
+            || has_cycle_errors;
+
+        eval_timer
+            .label("outcome", if has_errors { "error" } else { "success" })
+            .fin();
+
+        Ok(FlagsResponse::new(
+            has_errors,
+            flags_response.flags,
+            None,
+            request_id,
+        ))
+    }
+
+    /// Processes hash key overrides for feature flags with experience continuity enabled.
+    ///
+    /// This method handles the logic for managing hash key overrides, which are used to ensure
+    /// consistent feature flag experiences across different distinct IDs (e.g., when a user logs in).
+    /// It performs the following steps:
+    ///
+    /// 1. Checks if a hash key override needs to be written by comparing the current distinct ID
+    ///    with the provided hash key
+    /// 2. If needed, writes the hash key override to the database using the writer connection
+    /// 3. Increments metrics to track successful/failed hash key override writes
+    /// 4. Retrieves and returns the current hash key overrides for the target distinct IDs
+    ///
+    /// Returns a tuple containing:
+    /// - Option<HashMap<String, String>>: The hash key overrides if successfully retrieved, None if there was an error
+    /// - bool: Whether there was an error during processing (true = error occurred)
+    #[instrument(skip_all, fields(team_id = %self.team_id, distinct_id = %self.distinct_id))]
+    async fn process_hash_key_override(
+        &self,
+        hash_key: String,
+        target_distinct_ids: Vec<String>,
+    ) -> (Option<HashMap<String, String>>, bool) {
+        let should_write = match should_write_hash_key_override(
+            &self.router,
+            self.team_id,
+            self.distinct_id.clone(),
+            hash_key.clone(),
+        )
+        .await
+        {
+            Ok(should_write) => should_write,
+            Err(e) => {
+                error!(
+                    "Failed to check if hash key override should be written for team {} distinct_id {}: {:?}",
+                    self.team_id, self.distinct_id, e
+                );
+                inc(
+                    FLAG_EVALUATION_ERROR_COUNTER,
+                    &[("reason".to_string(), e.evaluation_error_code())],
+                    1,
+                );
+                return (None, true);
+            }
+        };
+
+        let mut writing_hash_key_override = false;
+
+        if should_write {
+            if self.skip_writes {
+                tracing::debug!(
+                    team_id = self.team_id,
+                    distinct_id = %self.distinct_id,
+                    "SKIP_WRITES: skipping hash key override write to PostgreSQL"
+                );
+            } else {
+                if let Err(e) = set_feature_flag_hash_key_overrides(
+                    // NB: this is the only method that writes to the database
+                    &self.router,
+                    self.team_id,
+                    target_distinct_ids.clone(),
+                    hash_key.clone(),
+                )
+                .await
+                {
+                    error!("Failed to set feature flag hash key overrides for team {} distinct_id {} hash_key {}: {:?}", self.team_id, self.distinct_id, hash_key, e);
+                    inc(
+                        FLAG_EVALUATION_ERROR_COUNTER,
+                        &[("reason".to_string(), e.evaluation_error_code())],
+                        1,
+                    );
+                    return (None, true);
+                }
+                writing_hash_key_override = true;
+            }
+        }
+
+        inc(
+            FLAG_HASH_KEY_WRITES_COUNTER,
+            &[(
+                "successful_write".to_string(),
+                writing_hash_key_override.to_string(),
+            )],
+            1,
+        );
+
+        // When we're writing a hash_key_override, we query the main database (writer), not the replica (reader)
+        // This is because we need to make sure the write is successful before we read it back
+        // to avoid read-after-write consistency issues with database replication lag
+        let database_for_reading = if writing_hash_key_override {
+            self.router.get_persons_writer().clone()
+        } else {
+            self.router.get_persons_reader().clone()
+        };
+
+        match get_feature_flag_hash_key_overrides(
+            database_for_reading,
+            self.team_id,
+            target_distinct_ids,
+        )
+        .await
+        {
+            Ok(overrides) => (Some(overrides), false),
+            Err(e) => {
+                error!("Failed to get feature flag hash key overrides for team {} distinct_id {}: {:?}", self.team_id, self.distinct_id, e);
+                inc(
+                    FLAG_EVALUATION_ERROR_COUNTER,
+                    &[("reason".to_string(), e.evaluation_error_code())],
+                    1,
+                );
+                (None, true)
+            }
+        }
+    }
+
+    /// Evaluates cohort filters
+    /// Uses the static cohort results from the cache, and
+    /// evaluates dynamic cohorts based on the provided properties
+    /// (converts dynamic cohorts into property filters and then evaluates them)
+    pub fn evaluate_cohort_filters(
+        &self,
+        cohort_property_filters: &[PropertyFilter],
+        target_properties: &HashMap<String, Value>,
+        cohorts: Vec<Cohort>,
+    ) -> Result<bool, FlagError> {
+        // Track cohort evaluations in canonical log
+        with_canonical_log(|log| log.eval.cohorts_evaluated += cohort_property_filters.len());
+
+        // Get cached static cohort results or evaluate them if not cached
+        let static_cohort_matches = match self.flag_evaluation_state.get_static_cohort_matches() {
+            Some(matches) => matches.clone(),
+            None => HashMap::new(), // NB: this happens if a flag has static cohort filters but is targeting an anonymous user.  Shouldn't error, just return empty.
+        };
+
+        // Store all cohort match results, starting with static cohort results
+        let mut cohort_matches = static_cohort_matches;
+
+        // For any cohorts not yet evaluated (i.e., dynamic ones), evaluate them
+        for filter in cohort_property_filters {
+            let cohort_id = filter
+                .get_cohort_id()
+                .ok_or(FlagError::CohortFiltersParsingError)?;
+
+            if !cohort_matches.contains_key(&cohort_id) {
+                let current_matches = cohort_matches.clone();
+                let match_result = evaluate_dynamic_cohorts(
+                    cohort_id,
+                    target_properties,
+                    &cohorts,
+                    &current_matches,
+                )?;
+                cohort_matches.insert(cohort_id, match_result);
+            }
+        }
+
+        // Apply cohort membership logic (IN|NOT_IN) to the cohort match results
+        apply_cohort_membership_logic(cohort_property_filters, &cohort_matches)
+    }
+
+    /// Evaluates feature flags with property and hash key overrides.
+    ///
+    /// Takes a pre-built dependency graph which should already be filtered by flag_keys if needed.
+    /// The graph determines which flags are evaluated and in what order.
+    pub async fn evaluate_flags_with_overrides(
+        &mut self,
+        overrides: FlagEvaluationOverrides,
+        request_id: Uuid,
+        dependency_graph: DependencyGraph<FeatureFlag>,
+        flags_with_missing_deps: HashSet<i32>,
+    ) -> Result<FlagsResponse, FlagError> {
+        let mut errors_while_computing_flags = overrides.hash_key_override_error;
+        let mut evaluated_flags_map = HashMap::new();
+
+        // Collect flags from the graph for preparation steps
+        let flags: Vec<&FeatureFlag> = dependency_graph.iter_nodes().collect();
+
+        // Handle hash key override errors by creating error responses for flags that need experience continuity
+        if overrides.hash_key_override_error && overrides.hash_key_overrides.is_none() {
+            let hash_key_error = FlagError::HashKeyOverrideError;
+            for flag in flags.iter().filter(|flag| {
+                !self.filtered_out_flag_ids.contains(&flag.id)
+                    && flag.ensure_experience_continuity.unwrap_or(false)
+            }) {
+                evaluated_flags_map.insert(
+                    flag.key.clone(),
+                    FlagDetails::create_error(flag, &hash_key_error, None),
+                );
+            }
+        }
+
+        // Step 1: Initialize group type mappings if needed
+        errors_while_computing_flags |= self.initialize_group_type_mappings_if_needed(&flags).await;
+
+        // Step 2: Prepare evaluation state for flags requiring DB properties
+        let db_prep_errors = self
+            .prepare_evaluation_state_if_needed(
+                &flags,
+                &overrides.person_property_overrides,
+                &mut evaluated_flags_map,
+            )
+            .await;
+        errors_while_computing_flags |= db_prep_errors;
+
+        // Pre-seed filtered-out flags as false so dependency conditions like
+        // `flag_evaluates_to=false` can match against them.
+        for &flag_id in &self.filtered_out_flag_ids {
+            self.flag_evaluation_state
+                .add_flag_evaluation_result(flag_id, FlagValue::Boolean(false));
+        }
+
+        // Step 3: Evaluate flags using the dependency graph
+        let graph_evaluation_errors = self
+            .evaluate_flags_with_dependency_graph(
+                dependency_graph,
+                &overrides.person_property_overrides,
+                &overrides.group_property_overrides,
+                &overrides.hash_key_overrides,
+                &overrides.request_hash_key_override,
+                &mut evaluated_flags_map,
+                &flags_with_missing_deps,
+            )
+            .await?;
+        errors_while_computing_flags |= graph_evaluation_errors;
+
+        Ok(FlagsResponse::new(
+            errors_while_computing_flags,
+            evaluated_flags_map,
+            None,
+            request_id,
+        ))
+    }
+
+    /// Evaluates flags using the provided dependency graph.
+    /// Returns true if there were errors during evaluation.
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_flags_with_dependency_graph(
+        &mut self,
+        flag_dependency_graph: DependencyGraph<FeatureFlag>,
+        person_property_overrides: &Option<HashMap<String, Value>>,
+        group_property_overrides: &Option<HashMap<String, HashMap<String, Value>>>,
+        hash_key_overrides: &Option<HashMap<String, String>>,
+        request_hash_key_override: &Option<String>,
+        evaluated_flags_map: &mut HashMap<String, FlagDetails>,
+        flags_with_missing_deps: &HashSet<i32>,
+    ) -> Result<bool, FlagError> {
+        // Consume the graph to get owned flags in evaluation order
+        let evaluation_stages = match flag_dependency_graph.into_evaluation_stages() {
+            Ok(stages) => stages,
+            Err(e) => {
+                log_dependency_graph_operation_error("get evaluation stages", &e, self.team_id);
+                return Ok(true);
+            }
+        };
+
+        // Evaluate flags in dependency order
+        let mut errors_while_computing_flags = false;
+        for stage in evaluation_stages {
+            let (level_evaluated_flags_map, level_errors) = self
+                .evaluate_flags_in_level(
+                    stage,
+                    evaluated_flags_map,
+                    person_property_overrides,
+                    group_property_overrides,
+                    hash_key_overrides,
+                    request_hash_key_override,
+                    flags_with_missing_deps,
+                )
+                .await?;
+            errors_while_computing_flags |= level_errors;
+            evaluated_flags_map.extend(level_evaluated_flags_map);
+        }
+
+        Ok(errors_while_computing_flags)
+    }
+
+    /// Prepares evaluation state for flags that require database properties.
+    /// Returns true if there were errors during preparation.
+    #[instrument(skip_all, fields(team_id = %self.team_id, distinct_id = %self.distinct_id))]
+    async fn prepare_evaluation_state_if_needed(
+        &mut self,
+        flags: &[&FeatureFlag],
+        person_property_overrides: &Option<HashMap<String, Value>>,
+        evaluated_flags_map: &mut HashMap<String, FlagDetails>,
+    ) -> bool {
+        let flags_requiring_db_preparation = flags_require_db_preparation(
+            flags,
+            person_property_overrides
+                .as_ref()
+                .unwrap_or(&HashMap::new()),
+            &self.filtered_out_flag_ids,
+        );
+
+        if flags_requiring_db_preparation.is_empty() {
+            return false;
+        }
+
+        match self
+            .prepare_flag_evaluation_state(flags_requiring_db_preparation.as_slice())
+            .await
+        {
+            Ok(_) => false,
+            Err(e) => {
+                self.handle_db_preparation_error(
+                    &flags_requiring_db_preparation,
+                    &e,
+                    evaluated_flags_map,
+                );
+                true
+            }
+        }
+    }
+
+    /// Handles errors during database preparation by creating error responses for affected flags.
+    fn handle_db_preparation_error(
+        &self,
+        flags_requiring_db_preparation: &[&FeatureFlag],
+        error: &FlagError,
+        evaluated_flags_map: &mut HashMap<String, FlagDetails>,
+    ) {
+        evaluated_flags_map.extend(flags_requiring_db_preparation.iter().map(|flag| {
+            (
+                flag.key.clone(),
+                FlagDetails::create_error(flag, error, None),
+            )
+        }));
+
+        error!(
+            "Error preparing flag evaluation state for team {} distinct_id {}: {:?}",
+            self.team_id, self.distinct_id, error
+        );
+
+        let reason = error.evaluation_error_code();
+        inc(
+            FLAG_EVALUATION_ERROR_COUNTER,
+            &[("reason".to_string(), reason)],
+            1,
+        );
+    }
+
+    /// Evaluates a set of flags with a combination of property overrides and DB properties
+    ///
+    /// This function is designed to be used as part of a level-based evaluation strategy
+    /// (e.g., Kahn's algorithm) for handling flag dependencies.
+    ///
+    /// Dispatches between sequential and parallel evaluation based on flag count.
+    /// Sequential: borrows flags by reference (zero-copy).
+    /// Parallel: moves owned flags into a rayon task via oneshot channel.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all, fields(team_id = %self.team_id, distinct_id = %self.distinct_id))]
+    async fn evaluate_flags_in_level(
+        &mut self,
+        flags: Vec<FeatureFlag>,
+        evaluated_flags_map: &mut HashMap<String, FlagDetails>,
+        person_property_overrides: &Option<HashMap<String, Value>>,
+        group_property_overrides: &Option<HashMap<String, HashMap<String, Value>>>,
+        hash_key_overrides: &Option<HashMap<String, String>>,
+        request_hash_key_override: &Option<String>,
+        flags_with_missing_deps: &HashSet<i32>,
+    ) -> Result<(HashMap<String, FlagDetails>, bool), FlagError> {
+        let mut errors_while_computing_flags = false;
+        let mut level_evaluated_flags_map = HashMap::new();
+
+        let flags_to_evaluate: Vec<FeatureFlag> = flags
+            .into_iter()
+            .filter(|flag| {
+                !flag.deleted
+                    && flag.active
+                    && !self.filtered_out_flag_ids.contains(&flag.id)
+                    && !evaluated_flags_map.contains_key(&flag.key)
+            })
+            .collect();
+
+        let precomputed_property_overrides = self.precompute_property_overrides(
+            &flags_to_evaluate,
+            person_property_overrides,
+            group_property_overrides,
+        );
+
+        let eval_type = if flags_to_evaluate.len() >= self.parallel_eval_threshold {
+            EvaluationType::Parallel
+        } else {
+            EvaluationType::Sequential
+        };
+
+        // Record evaluation type in canonical log for E2E latency metrics.
+        // Skip if no flags to evaluate (all deleted, filtered out, or already evaluated) — lets the
+        // metric label stay None → "none" rather than incorrectly reporting Sequential.
+        if !flags_to_evaluate.is_empty() {
+            with_canonical_log(|log| {
+                log.evaluation_type = EvaluationType::promote(log.evaluation_type, eval_type);
+            });
+        }
+
+        let labels = [("evaluation_type".to_string(), eval_type.to_string())];
+        histogram(FLAG_BATCH_SIZE, &labels, flags_to_evaluate.len() as f64);
+        inc(FLAG_BATCH_EVALUATION_COUNTER, &labels, 1);
+        let _batch_timer = timing_guard(FLAG_BATCH_EVALUATION_TIME, &labels);
+
+        let flag_get_match_timer = timing_guard(FLAG_GET_MATCH_TIME, &[]);
+
+        match eval_type {
+            EvaluationType::Sequential => {
+                flags_to_evaluate.iter().for_each(|flag| {
+                    let result = self.evaluate_single_flag(
+                        flag,
+                        &precomputed_property_overrides,
+                        flags_with_missing_deps,
+                        hash_key_overrides,
+                        request_hash_key_override,
+                    );
+                    self.process_flag_result(
+                        flag,
+                        &result,
+                        &mut level_evaluated_flags_map,
+                        &mut errors_while_computing_flags,
+                    );
+                });
+            }
+            EvaluationType::Parallel => {
+                let results = self
+                    .evaluate_batch_parallel(
+                        flags_to_evaluate,
+                        precomputed_property_overrides,
+                        flags_with_missing_deps,
+                        hash_key_overrides,
+                        request_hash_key_override,
+                    )
+                    .await?;
+
+                for (flag, result) in &results {
+                    self.process_flag_result(
+                        flag,
+                        result,
+                        &mut level_evaluated_flags_map,
+                        &mut errors_while_computing_flags,
+                    );
+                }
+            }
+        }
+
+        flag_get_match_timer
+            .label(
+                "outcome",
+                if errors_while_computing_flags {
+                    "error"
+                } else {
+                    "success"
+                },
+            )
+            .fin();
+
+        Ok((level_evaluated_flags_map, errors_while_computing_flags))
+    }
+
+    /// Pre-compute property overrides for all flags upfront.
+    // TODO: We can probably do this even earlier, but I'll save that for another PR - @haacked
+    fn precompute_property_overrides(
+        &mut self,
+        flags: &[FeatureFlag],
+        person_property_overrides: &Option<HashMap<String, Value>>,
+        group_property_overrides: &Option<HashMap<String, HashMap<String, Value>>>,
+    ) -> HashMap<String, Option<HashMap<String, Value>>> {
+        let mut overrides = HashMap::new();
+        for flag in flags {
+            let relevant = match flag.get_group_type_index() {
+                Some(group_type_index) => {
+                    match self.group_overrides_to_property_overrides(
+                        group_type_index,
+                        group_property_overrides,
+                    ) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            warn!(
+                                "Failed to get group type mapping for flag '{}' with group_type_index {}: {:?}. Treating as no overrides.",
+                                flag.key, group_type_index, e
+                            );
+                            None
+                        }
+                    }
+                }
+                None => person_property_overrides.clone(),
+            };
+            overrides.insert(flag.key.clone(), relevant);
+        }
+        overrides
+    }
+
+    /// Process a single flag evaluation result: update evaluation state, record metrics, and
+    /// insert into the level map.
+    fn process_flag_result(
+        &mut self,
+        flag: &FeatureFlag,
+        result: &Result<FeatureFlagMatch, FlagError>,
+        level_evaluated_flags_map: &mut HashMap<String, FlagDetails>,
+        errors_while_computing_flags: &mut bool,
+    ) {
+        match result {
+            Ok(flag_match) => {
+                self.flag_evaluation_state
+                    .add_flag_evaluation_result(flag.id, flag_match.get_flag_value());
+                level_evaluated_flags_map
+                    .insert(flag.key.clone(), FlagDetails::create(flag, flag_match));
+            }
+            Err(e) => {
+                *errors_while_computing_flags = true;
+                with_canonical_log(|log| log.flags_errored += 1);
+
+                if let FlagError::DependencyNotFound(dependency_type, dependency_id) = e {
+                    warn!(
+                        "Feature flag '{}' targeting deleted {} with id {} for distinct_id '{}': {:?}",
+                        flag.key, dependency_type, dependency_id, self.distinct_id, e
+                    );
+                } else {
+                    error!(
+                        "Error evaluating feature flag '{}' for distinct_id '{}': {:?}",
+                        flag.key, self.distinct_id, e
+                    );
+                }
+
+                let reason = e.evaluation_error_code();
+                inc(
+                    FLAG_EVALUATION_ERROR_COUNTER,
+                    &[("reason".to_string(), reason)],
+                    1,
+                );
+                level_evaluated_flags_map
+                    .insert(flag.key.clone(), FlagDetails::create_error(flag, e, None));
+            }
+        }
+    }
+
+    /// Convert group overrides to property overrides
+    fn group_overrides_to_property_overrides(
+        &mut self,
+        group_type_index: GroupTypeIndex,
+        group_property_overrides: &Option<HashMap<String, HashMap<String, Value>>>,
+    ) -> Result<Option<HashMap<String, Value>>, FlagError> {
+        // If we can't get the mapping, just return None
+        let index_to_type_map = match self
+            .group_type_mapping_cache
+            .get_group_type_index_to_type_map()
+        {
+            Ok(map) => map,
+            Err(FlagError::NoGroupTypeMappings) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        if let Some(group_type) = index_to_type_map.get(&group_type_index) {
+            if let Some(group_overrides) = group_property_overrides {
+                if let Some(group_overrides_by_type) = group_overrides.get(group_type) {
+                    return Ok(Some(group_overrides_by_type.clone()));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Pushes CPU-bound flag evaluation onto the Rayon pool via [`RayonDispatcher`],
+    /// so the calling Tokio worker thread is free to serve other requests while
+    /// evaluation runs. The dispatcher bounds how many batches can be in-flight
+    /// simultaneously, preventing unbounded queue growth and preserving per-batch
+    /// work-stealing parallelism.
+    async fn evaluate_batch_parallel(
+        &self,
+        flags_to_evaluate: Vec<FeatureFlag>,
+        precomputed_property_overrides: HashMap<String, Option<HashMap<String, Value>>>,
+        flags_with_missing_deps: &HashSet<i32>,
+        hash_key_overrides: &Option<HashMap<String, String>>,
+        request_hash_key_override: &Option<String>,
+    ) -> Result<Vec<(FeatureFlag, Result<FeatureFlagMatch, FlagError>)>, FlagError> {
+        let matcher = self.clone();
+        let missing_deps = flags_with_missing_deps.clone();
+        let hash_overrides = hash_key_overrides.clone();
+        let req_hash_override = request_hash_key_override.clone();
+
+        // Save lightweight snapshots before moving flags into rayon.
+        // If the rayon task panics, we use these to construct per-flag error results
+        // instead of silently dropping flags from the response.
+        let team_id = self.team_id;
+        let flag_snapshots: Vec<_> = flags_to_evaluate
+            .iter()
+            .map(FlagSnapshot::from_flag)
+            .collect();
+
+        // Each rayon thread accumulates evaluation counters in a thread-local
+        // FlagsCanonicalLogLine. After evaluation, the per-flag deltas are
+        // returned alongside each flag result and merged into the request's
+        // tokio task-local canonical log.
+        let work = move || {
+            flags_to_evaluate
+                .into_par_iter()
+                .map(|flag| {
+                    let _guard = install_rayon_canonical_log();
+                    let result = matcher.evaluate_single_flag(
+                        &flag,
+                        &precomputed_property_overrides,
+                        &missing_deps,
+                        &hash_overrides,
+                        &req_hash_override,
+                    );
+                    let delta = take_rayon_canonical_log();
+                    (flag, result, delta)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let result = match &self.rayon_dispatcher {
+            Some(dispatcher) => dispatcher
+                .try_spawn(work)
+                .await
+                .map_err(|t| FlagError::RayonSemaphoreTimeout(t.waited.as_millis() as u64))?,
+            None => {
+                // Fallback for tests: unbounded dispatch (no semaphore).
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rayon::spawn(move || {
+                    if let Ok(value) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                    {
+                        drop(tx.send(value));
+                    }
+                });
+                rx.await.ok()
+            }
+        };
+
+        let results_with_deltas = result.unwrap_or_else(|| {
+            error!("Rayon parallel evaluation task was dropped (likely panicked)");
+            Self::build_panic_fallback(flag_snapshots, team_id)
+                .into_iter()
+                .map(|(flag, result)| (flag, result, None))
+                .collect()
+        });
+
+        Ok(results_with_deltas
+            .into_iter()
+            .map(|(flag, result, delta)| {
+                if let Some(delta) = delta {
+                    with_canonical_log(|log| log.merge_rayon_delta(&delta));
+                }
+                (flag, result)
+            })
+            .collect())
+    }
+
+    /// Constructs per-flag error results from lightweight snapshots when the
+    /// rayon task panics and drops the oneshot sender.
+    fn build_panic_fallback(
+        snapshots: Vec<FlagSnapshot>,
+        team_id: TeamId,
+    ) -> Vec<(FeatureFlag, Result<FeatureFlagMatch, FlagError>)> {
+        snapshots
+            .into_iter()
+            .map(|snapshot| {
+                let stub = FeatureFlag {
+                    id: snapshot.id,
+                    key: snapshot.key,
+                    active: true,
+                    version: snapshot.version,
+                    filters: FlagFilters::default(),
+                    team_id,
+                    name: None,
+                    deleted: false,
+                    ensure_experience_continuity: None,
+                    evaluation_runtime: None,
+                    evaluation_tags: None,
+                    bucketing_identifier: None,
+                };
+                (stub, Err(FlagError::BatchEvaluationPanicked))
+            })
+            .collect()
+    }
+
+    fn evaluate_single_flag(
+        &self,
+        flag: &FeatureFlag,
+        precomputed_property_overrides: &HashMap<String, Option<HashMap<String, Value>>>,
+        flags_with_missing_deps: &HashSet<i32>,
+        hash_key_overrides: &Option<HashMap<String, String>>,
+        request_hash_key_override: &Option<String>,
+    ) -> Result<FeatureFlagMatch, FlagError> {
+        if flags_with_missing_deps.contains(&flag.id) {
+            return Ok(FeatureFlagMatch::missing_dependency());
+        }
+
+        let property_overrides = precomputed_property_overrides
+            .get(&flag.key)
+            .and_then(|opt| opt.as_ref());
+
+        self.get_match(
+            flag,
+            property_overrides,
+            hash_key_overrides.as_ref(),
+            request_hash_key_override,
+        )
+    }
+
+    /// Determines if a feature flag matches for the current context.
+    ///
+    /// This method evaluates the conditions of a feature flag to determine if it should be enabled,
+    /// and if so, which variant (if any) should be applied. It follows these steps:
+    ///
+    /// 1. Check if there's a valid hashed identifier for the flag.
+    /// 2. Evaluate any super conditions that might override normal conditions.
+    /// 3. Sort and evaluate each condition, prioritizing those with variant overrides.
+    /// 4. For each matching condition, determine the appropriate variant and payload.
+    /// 5. Return the result of the evaluation, including match status, variant, reason, and payload.
+    ///
+    /// The method also keeps track of the highest priority match reason and index,
+    /// which are used even if no conditions ultimately match.
+    pub fn get_match(
+        &self,
+        flag: &FeatureFlag,
+        property_overrides: Option<&HashMap<String, Value>>,
+        hash_key_overrides: Option<&HashMap<String, String>>,
+        request_hash_key_override: &Option<String>,
+    ) -> Result<FeatureFlagMatch, FlagError> {
+        // Check if this is a group-based flag with missing group
+        let hashed_id =
+            self.hashed_identifier(flag, hash_key_overrides, request_hash_key_override)?;
+        if flag.get_group_type_index().is_some() && hashed_id.is_empty() {
+            // This is a group-based flag but we don't have the group key
+            return Ok(FeatureFlagMatch {
+                matches: false,
+                variant: None,
+                reason: FeatureFlagMatchReason::NoGroupType,
+                condition_index: None,
+                payload: None,
+            });
+        }
+        // For person-based flags, empty distinct_id is valid and should continue evaluation
+        if flag.get_group_type_index().is_none() {
+            use crate::flags::flag_models::BucketingIdentifier;
+
+            if flag.get_bucketing_identifier() == BucketingIdentifier::DeviceId {
+                if self
+                    .device_id
+                    .as_ref()
+                    .is_some_and(|device_id| !device_id.is_empty())
+                {
+                    with_canonical_log(|log| log.eval.flags_device_id_bucketing += 1);
+                } else {
+                    with_canonical_log(|log| {
+                        tracing::warn!(
+                            flag_key = %flag.key,
+                            team_id = %flag.team_id,
+                            lib = log.lib,
+                            lib_version = log.lib_version.as_deref(),
+                            "Flag configured for device_id bucketing but no device_id provided, returning false"
+                        );
+                    });
+                    return Ok(FeatureFlagMatch {
+                        matches: false,
+                        variant: None,
+                        reason: FeatureFlagMatchReason::OutOfRolloutBound,
+                        condition_index: None,
+                        payload: None,
+                    });
+                }
+            }
+        }
+
+        let mut highest_match = FeatureFlagMatchReason::NoConditionMatch;
+        let mut highest_index = None;
+
+        // Lazily compute merged properties only when needed.
+        // For rollout-only flags (no property filters), we skip property fetching entirely.
+        // When properties ARE needed, we compute once and reuse for all conditions.
+        let mut cached_properties: Option<HashMap<String, Value>> = None;
+
+        // Evaluate any super conditions first.
+        // Super conditions (early access features) always use person properties, even for
+        // group-based flags. This is because early access enrollment is a person-level concept.
+        // The API validates that group-based flags cannot have early access features attached.
+        if let Some(super_groups) = &flag.filters.super_groups {
+            if let Some(super_condition) = super_groups.first() {
+                // Only fetch person properties if the super condition has property filters
+                // Super conditions are used for feature enrollment (aka early access features)
+                // There can only be one condition ever in super conditions.
+                if super_condition
+                    .properties
+                    .as_ref()
+                    .is_some_and(|p| !p.is_empty())
+                {
+                    let person_properties = self.get_person_properties(property_overrides)?;
+                    let super_condition_evaluation = self.is_super_condition_match(
+                        flag,
+                        &person_properties,
+                        hash_key_overrides,
+                        request_hash_key_override,
+                    )?;
+
+                    if super_condition_evaluation.should_evaluate {
+                        let payload = self.get_matching_payload(None, flag);
+                        return Ok(FeatureFlagMatch {
+                            matches: super_condition_evaluation.is_match,
+                            variant: None,
+                            reason: super_condition_evaluation.reason,
+                            condition_index: Some(0),
+                            payload,
+                        });
+                    }
+                    // if no match, continue to normal conditions
+                }
+            }
+        }
+
+        // Match for holdout super condition
+        // TODO: Flags shouldn't have both super_groups and holdout_groups
+        // TODO: Validate only multivariant flags to have holdout groups. I could make this implicit by reusing super_groups but
+        // this will shoot ourselves in the foot when we extend early access to support variants as well.
+        // TODO: Validate holdout variant should have 0% default rollout %?
+        // TODO: All this validation we need to do suggests the modelling is imperfect here. Carrying forward for now, we'll only enable
+        // in beta, and potentially rework representation before rolling out to everyone. Probably the problem is holdout groups are an
+        // experiment level concept that applies across experiments, and we are creating a feature flag level primitive to handle it.
+        // Validating things like the variant name is the same across all flags, rolled out to 0%, has the same correct conditions is a bit of
+        // a pain here. But I'm not sure if feature flags should indeed know all this info. It's fine for them to just work with what they're given.
+        if let Some(holdout_groups) = &flag.filters.holdout_groups {
+            if !holdout_groups.is_empty() {
+                let (is_match, holdout_value, evaluation_reason) =
+                    self.is_holdout_condition_match(flag, request_hash_key_override)?;
+                if is_match {
+                    let payload = self.get_matching_payload(holdout_value.as_deref(), flag);
+                    return Ok(FeatureFlagMatch {
+                        matches: true,
+                        variant: holdout_value,
+                        reason: evaluation_reason,
+                        condition_index: None,
+                        payload,
+                    });
+                }
+            }
+        }
+        let conditions: Vec<(usize, &FlagPropertyGroup)> =
+            flag.get_conditions().iter().enumerate().collect();
+
+        let condition_timer = common_metrics::timing_guard(FLAG_EVALUATE_ALL_CONDITIONS_TIME, &[]);
+        for (index, condition) in conditions {
+            // Lazily compute properties only when a condition actually needs them.
+            // A condition needs properties if it has non-empty property filters that aren't
+            // purely flag-value filters (which don't require person/group properties).
+            let properties_ref = if Self::condition_needs_properties(condition) {
+                if cached_properties.is_none() {
+                    cached_properties =
+                        Some(self.get_properties_to_check(flag, property_overrides)?);
+                }
+                cached_properties.as_ref().unwrap()
+            } else {
+                // Use a static empty map for conditions that don't need properties
+                static EMPTY_MAP: std::sync::LazyLock<HashMap<String, Value>> =
+                    std::sync::LazyLock::new(HashMap::new);
+                &*EMPTY_MAP
+            };
+
+            let (is_match, reason) = self.is_condition_match(
+                flag,
+                condition,
+                properties_ref,
+                hash_key_overrides,
+                request_hash_key_override,
+            )?;
+
+            // Update highest_match and highest_index
+            let (new_highest_match, new_highest_index) = self
+                .get_highest_priority_match_evaluation(
+                    highest_match.clone(),
+                    highest_index,
+                    reason.clone(),
+                    Some(index),
+                );
+            highest_match = new_highest_match;
+            highest_index = new_highest_index;
+
+            if is_match {
+                if highest_match == FeatureFlagMatchReason::SuperConditionValue {
+                    break; // Exit early if we've found a super condition match
+                }
+
+                // Check for variant override in the condition
+                let variant = if let Some(variant_override) = &condition.variant {
+                    // Check if the override is a valid variant
+                    if flag
+                        .get_variants()
+                        .iter()
+                        .any(|v| &v.key == variant_override)
+                    {
+                        Some(variant_override.clone())
+                    } else {
+                        // If override isn't valid, fall back to computed variant
+                        self.get_matching_variant(
+                            flag,
+                            hash_key_overrides,
+                            request_hash_key_override,
+                        )?
+                    }
+                } else {
+                    // No override, use computed variant
+                    self.get_matching_variant(flag, hash_key_overrides, request_hash_key_override)?
+                };
+                let payload = self.get_matching_payload(variant.as_deref(), flag);
+
+                return Ok(FeatureFlagMatch {
+                    matches: true,
+                    variant,
+                    reason: highest_match,
+                    condition_index: highest_index,
+                    payload,
+                });
+            }
+        }
+
+        condition_timer.label("outcome", "success").fin();
+        // Return with the highest_match reason and index even if no conditions matched
+        Ok(FeatureFlagMatch {
+            matches: false,
+            variant: None,
+            reason: highest_match,
+            condition_index: highest_index,
+            payload: None,
+        })
+    }
+
+    /// This function determines the highest priority match evaluation for feature flag conditions.
+    /// It compares the current match reason with a new match reason and returns the higher priority one.
+    /// The priority is determined by the ordering of FeatureFlagMatchReason variants.
+    /// It's used to keep track of the most significant reason why a flag matched or didn't match,
+    /// especially useful when multiple conditions are evaluated.
+    fn get_highest_priority_match_evaluation(
+        &self,
+        current_match: FeatureFlagMatchReason,
+        current_index: Option<usize>,
+        new_match: FeatureFlagMatchReason,
+        new_index: Option<usize>,
+    ) -> (FeatureFlagMatchReason, Option<usize>) {
+        if current_match <= new_match {
+            (new_match, new_index)
+        } else {
+            (current_match, current_index)
+        }
+    }
+
+    /// Check if a condition matches for a feature flag.
+    ///
+    /// This function evaluates a specific condition of a feature flag to determine if it should be enabled.
+    /// It first checks if the condition has any property filters. If not, it performs a rollout check.
+    /// Otherwise, it checks if the pre-computed merged properties match the condition's filters.
+    /// The function returns a tuple indicating whether the condition matched and the reason for the match.
+    ///
+    /// Note: `merged_properties` should be pre-computed by the caller using `get_properties_to_check()`
+    /// to avoid redundant HashMap clones and merges when evaluating multiple conditions.
+    pub(crate) fn is_condition_match(
+        &self,
+        feature_flag: &FeatureFlag,
+        condition: &FlagPropertyGroup,
+        merged_properties: &HashMap<String, Value>,
+        hash_key_overrides: Option<&HashMap<String, String>>,
+        request_hash_key_override: &Option<String>,
+    ) -> Result<(bool, FeatureFlagMatchReason), FlagError> {
+        let rollout_percentage = condition.rollout_percentage.unwrap_or(100.0);
+
+        if let Some(flag_property_filters) = &condition.properties {
+            if flag_property_filters.is_empty() {
+                return self.check_rollout(
+                    feature_flag,
+                    rollout_percentage,
+                    hash_key_overrides,
+                    request_hash_key_override,
+                );
+            }
+
+            // Separate flag value filters from other filters
+            let (flag_value_filters, other_filters): (Vec<PropertyFilter>, Vec<PropertyFilter>) =
+                flag_property_filters
+                    .iter()
+                    .cloned()
+                    .partition(|prop| prop.depends_on_feature_flag());
+
+            if !flag_value_filters.is_empty()
+                && !all_flag_condition_properties_match(
+                    &flag_value_filters,
+                    &self.flag_evaluation_state.flag_evaluation_results,
+                )
+            {
+                return Ok((false, FeatureFlagMatchReason::NoConditionMatch));
+            }
+
+            // Separate cohort and non-cohort filters
+            let (cohort_filters, non_cohort_filters): (Vec<PropertyFilter>, Vec<PropertyFilter>) =
+                other_filters
+                    .iter()
+                    .cloned()
+                    .partition(|prop| prop.is_cohort());
+
+            // Evaluate non-cohort filters first, since they're cheaper to evaluate and we can return early if they don't match
+            if !all_properties_match(&non_cohort_filters, merged_properties) {
+                return Ok((false, FeatureFlagMatchReason::NoConditionMatch));
+            }
+
+            // Evaluate cohort filters, if any.
+            if !cohort_filters.is_empty() {
+                let cohorts = match &self.flag_evaluation_state.cohorts {
+                    Some(cohorts) => cohorts.clone(),
+                    None => return Ok((false, FeatureFlagMatchReason::NoConditionMatch)),
+                };
+                if !self.evaluate_cohort_filters(&cohort_filters, merged_properties, cohorts)? {
+                    return Ok((false, FeatureFlagMatchReason::NoConditionMatch));
+                }
+            }
+        }
+
+        self.check_rollout(
+            feature_flag,
+            rollout_percentage,
+            hash_key_overrides,
+            request_hash_key_override,
+        )
+    }
+
+    /// Checks if a condition requires person/group properties to evaluate.
+    /// Returns false for rollout-only conditions or conditions with only flag-value filters.
+    fn condition_needs_properties(condition: &FlagPropertyGroup) -> bool {
+        condition.properties.as_ref().is_some_and(|props| {
+            // Check if there are any non-flag-value property filters
+            props.iter().any(|prop| !prop.depends_on_feature_flag())
+        })
+    }
+
+    /// Gets the properties to check for a feature flag condition, merging DB properties with overrides.
+    /// Overrides take precedence over DB properties when both are present.
+    fn get_properties_to_check(
+        &self,
+        feature_flag: &FeatureFlag,
+        property_overrides: Option<&HashMap<String, Value>>,
+    ) -> Result<HashMap<String, Value>, FlagError> {
+        match feature_flag.get_group_type_index() {
+            Some(group_type_index) => {
+                self.get_group_properties(group_type_index, property_overrides)
+            }
+            None => self.get_person_properties(property_overrides),
+        }
+    }
+
+    /// Gets group properties by merging DB properties with overrides (overrides take precedence).
+    fn get_group_properties(
+        &self,
+        group_type_index: GroupTypeIndex,
+        property_overrides: Option<&HashMap<String, Value>>,
+    ) -> Result<HashMap<String, Value>, FlagError> {
+        // Start with DB properties
+        let mut merged_properties =
+            self.get_group_properties_from_evaluation_state(group_type_index)?;
+
+        // Merge in overrides (overrides take precedence)
+        if let Some(overrides) = property_overrides {
+            merged_properties.extend(overrides.iter_owned());
+        }
+
+        // Return all merged properties
+        Ok(merged_properties)
+    }
+
+    /// Gets person properties by merging DB properties with overrides (overrides take precedence).
+    fn get_person_properties(
+        &self,
+        property_overrides: Option<&HashMap<String, Value>>,
+    ) -> Result<HashMap<String, Value>, FlagError> {
+        // Start with DB properties
+        let mut merged_properties = self
+            .get_person_properties_from_evaluation_state()
+            .unwrap_or_default();
+
+        // Merge in overrides (overrides take precedence)
+        if let Some(overrides) = property_overrides {
+            merged_properties.extend(overrides.iter_owned());
+        }
+
+        // Populate missing $initial_ properties from their non-initial counterparts.
+        // DB $initial_ values are preserved; this only fills in missing ones from
+        // the merged properties (which may come from DB or request overrides).
+        populate_missing_initial_properties(&mut merged_properties);
+
+        Ok(merged_properties)
+    }
+
+    fn is_holdout_condition_match(
+        &self,
+        flag: &FeatureFlag,
+        request_hash_key_override: &Option<String>,
+    ) -> Result<(bool, Option<String>, FeatureFlagMatchReason), FlagError> {
+        // TODO: Right now holdout conditions only support basic rollout %s, and not property overrides.
+
+        if let Some(holdout_groups) = &flag.filters.holdout_groups {
+            if !holdout_groups.is_empty() {
+                let condition = &holdout_groups[0];
+                // TODO: Check properties and match based on them
+
+                if condition.properties.as_ref().is_some_and(|p| !p.is_empty()) {
+                    return Ok((false, None, FeatureFlagMatchReason::NoConditionMatch));
+                }
+
+                let rollout_percentage = condition.rollout_percentage;
+
+                if let Some(percentage) = rollout_percentage {
+                    if percentage < 100.0
+                        && self.get_holdout_hash(flag, None, request_hash_key_override)?
+                            > (percentage / 100.0)
+                    {
+                        // If hash is greater than percentage, we're OUT of holdout
+                        return Ok((false, None, FeatureFlagMatchReason::OutOfRolloutBound));
+                    }
+                }
+
+                // rollout_percentage is None (=100%), or we are inside holdout rollout bound.
+                // Thus, we match. Now get the variant override for the holdout condition.
+                let variant = if let Some(variant_override) = condition.variant.as_ref() {
+                    variant_override.clone()
+                } else {
+                    self.get_matching_variant(flag, None, request_hash_key_override)?
+                        .unwrap_or_else(|| "holdout".to_string())
+                };
+
+                return Ok((
+                    true,
+                    Some(variant),
+                    FeatureFlagMatchReason::HoldoutConditionValue,
+                ));
+            }
+        }
+        Ok((false, None, FeatureFlagMatchReason::NoConditionMatch))
+    }
+
+    /// Check if a super condition matches for a feature flag.
+    ///
+    /// This function evaluates the super conditions of a feature flag to determine if any of them should be enabled.
+    /// It uses pre-computed person properties (DB properties with overrides applied).
+    /// The function returns a struct indicating whether a super condition should be evaluated,
+    /// whether it matches if evaluated, and the reason for the match.
+    ///
+    /// Note: Super conditions (early access features) always use person properties, even for
+    /// group-based flags, because early access enrollment is a person-level concept.
+    fn is_super_condition_match(
+        &self,
+        feature_flag: &FeatureFlag,
+        person_properties: &HashMap<String, Value>,
+        hash_key_overrides: Option<&HashMap<String, String>>,
+        request_hash_key_override: &Option<String>,
+    ) -> Result<SuperConditionEvaluation, FlagError> {
+        if let Some(super_condition) = feature_flag
+            .filters
+            .super_groups
+            .as_ref()
+            .and_then(|sc| sc.first())
+        {
+            let has_relevant_super_condition_properties =
+                super_condition.properties.as_ref().is_some_and(|props| {
+                    props
+                        .iter()
+                        .any(|prop| person_properties.contains_key(&prop.key))
+                });
+
+            if has_relevant_super_condition_properties {
+                let (is_match, _) = self.is_condition_match(
+                    feature_flag,
+                    super_condition,
+                    person_properties,
+                    hash_key_overrides,
+                    request_hash_key_override,
+                )?;
+
+                return Ok(SuperConditionEvaluation {
+                    should_evaluate: true,
+                    is_match,
+                    reason: FeatureFlagMatchReason::SuperConditionValue,
+                });
+            }
+        }
+
+        Ok(SuperConditionEvaluation {
+            should_evaluate: false,
+            is_match: false,
+            reason: FeatureFlagMatchReason::NoConditionMatch,
+        })
+    }
+
+    /// Get hashed identifier for a feature flag.
+    ///
+    /// This function generates a hashed identifier for a feature flag based on the feature flag's group type index.
+    /// If the feature flag is group-based, it fetches the group key; otherwise, it uses the distinct ID.
+    ///
+    /// For person-based flags with ensure_experience_continuity enabled, the identifier priority is:
+    /// 1. DB-stored hash_key_override (for consistency across sessions)
+    /// 2. Request's hash_key_override (anon_distinct_id) for first-time evaluations
+    /// 3. distinct_id (final fallback)
+    fn hashed_identifier(
+        &self,
+        feature_flag: &FeatureFlag,
+        hash_key_overrides: Option<&HashMap<String, String>>,
+        request_hash_key_override: &Option<String>,
+    ) -> Result<String, FlagError> {
+        if let Some(group_type_index) = feature_flag.get_group_type_index() {
+            // Group-based flag
+            let group_key = match self
+                .group_type_mapping_cache
+                .get_group_type_index_to_type_map()?
+                .get(&group_type_index)
+                .and_then(|group_type_name| self.groups.get(group_type_name))
+            {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                Some(_) => {
+                    // For any other JSON type (bool, array, object, null), use empty string
+                    // NB: we currently use empty string ("") as the hashed identifier for group flags without a group key,
+                    // and I don't want to break parity with the old service since I don't want the hash values to change
+                    "".to_string()
+                }
+                None => "".to_string(),
+            };
+
+            Ok(group_key)
+        } else {
+            // Person-based flag
+            use crate::flags::flag_models::BucketingIdentifier;
+
+            // Check if flag is configured for device_id bucketing
+            if feature_flag.get_bucketing_identifier() == BucketingIdentifier::DeviceId {
+                if let Some(device_id) = &self.device_id {
+                    if !device_id.is_empty() {
+                        return Ok(device_id.clone());
+                    }
+                }
+            }
+
+            // Use hash key overrides for experience continuity
+            // Priority: DB override > request's anon_distinct_id > distinct_id
+            if let Some(hash_key_override) = hash_key_overrides
+                .as_ref()
+                .and_then(|h| h.get(&feature_flag.key))
+            {
+                Ok(hash_key_override.clone())
+            } else if feature_flag.has_experience_continuity() {
+                // For EEC flags, use the request's anon_distinct_id as fallback when no DB override exists
+                if let Some(request_override) = request_hash_key_override {
+                    Ok(request_override.clone())
+                } else {
+                    Ok(self.distinct_id.clone())
+                }
+            } else {
+                Ok(self.distinct_id.clone())
+            }
+        }
+    }
+
+    /// This function takes a identifier and a feature flag key and returns a float between 0 and 1.
+    /// Given the same identifier and key, it'll always return the same float. These floats are
+    /// uniformly distributed between 0 and 1, so if we want to show this feature to 20% of traffic
+    /// we can do _hash(key, identifier) < 0.2
+    fn get_hash(
+        &self,
+        feature_flag: &FeatureFlag,
+        salt: &str,
+        hash_key_overrides: Option<&HashMap<String, String>>,
+        request_hash_key_override: &Option<String>,
+    ) -> Result<f64, FlagError> {
+        let hashed_identifier =
+            self.hashed_identifier(feature_flag, hash_key_overrides, request_hash_key_override)?;
+        if hashed_identifier.is_empty() {
+            // Return a hash value that will make the flag evaluate to false; since we
+            // can't evaluate a flag without an identifier.
+            return Ok(0.0); // NB: A flag with 0.0 hash will always evaluate to false
+        }
+
+        calculate_hash(&format!("{}.", feature_flag.key), &hashed_identifier, salt)
+    }
+
+    fn get_holdout_hash(
+        &self,
+        feature_flag: &FeatureFlag,
+        salt: Option<&str>,
+        request_hash_key_override: &Option<String>,
+    ) -> Result<f64, FlagError> {
+        let hashed_identifier =
+            self.hashed_identifier(feature_flag, None, request_hash_key_override)?;
+        let hash = calculate_hash("holdout-", &hashed_identifier, salt.unwrap_or(""))?;
+        Ok(hash)
+    }
+
+    /// Check if a feature flag should be shown based on its rollout percentage.
+    ///
+    /// This function determines if a feature flag should be shown to a user based on the flag's rollout percentage.
+    /// It first calculates a hash of the feature flag's identifier and compares it to the rollout percentage.
+    /// If the hash value is less than or equal to the rollout percentage, the flag is shown; otherwise, it is not.
+    /// The function returns a tuple indicating whether the flag matched and the reason for the match.
+    fn check_rollout(
+        &self,
+        feature_flag: &FeatureFlag,
+        rollout_percentage: f64,
+        hash_key_overrides: Option<&HashMap<String, String>>,
+        request_hash_key_override: &Option<String>,
+    ) -> Result<(bool, FeatureFlagMatchReason), FlagError> {
+        if rollout_percentage == 100.0 {
+            return Ok((true, FeatureFlagMatchReason::ConditionMatch));
+        }
+        let hash = self.get_hash(
+            feature_flag,
+            "",
+            hash_key_overrides,
+            request_hash_key_override,
+        )?;
+        if hash <= (rollout_percentage / 100.0) {
+            Ok((true, FeatureFlagMatchReason::ConditionMatch))
+        } else {
+            Ok((false, FeatureFlagMatchReason::OutOfRolloutBound))
+        }
+    }
+
+    /// This function takes a feature flag and returns the key of the variant that should be shown to the user.
+    pub(crate) fn get_matching_variant(
+        &self,
+        feature_flag: &FeatureFlag,
+        hash_key_overrides: Option<&HashMap<String, String>>,
+        request_hash_key_override: &Option<String>,
+    ) -> Result<Option<String>, FlagError> {
+        let hash = self.get_hash(
+            feature_flag,
+            "variant",
+            hash_key_overrides,
+            request_hash_key_override,
+        )?;
+        let mut cumulative_percentage = 0.0;
+
+        for variant in feature_flag.get_variants() {
+            cumulative_percentage += variant.rollout_percentage / 100.0;
+            if hash < cumulative_percentage {
+                return Ok(Some(variant.key.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Get matching payload for a feature flag.
+    ///
+    /// This function retrieves the payload associated with a matching variant of a feature flag.
+    /// It takes the matched variant key and the feature flag itself as inputs and returns the payload.
+    fn get_matching_payload(
+        &self,
+        match_variant: Option<&str>,
+        feature_flag: &FeatureFlag,
+    ) -> Option<serde_json::Value> {
+        let variant = match_variant.unwrap_or("true");
+        feature_flag.get_payload(variant)
+    }
+
+    /// Prepares all database-sourced data needed for flag evaluation.
+    /// This includes:
+    /// - Static cohort memberships
+    /// - Group type mappings
+    /// - Person and group properties
+    ///
+    /// The data is cached in FlagEvaluationState to avoid repeated DB lookups
+    /// during subsequent flag evaluations.
+    pub async fn prepare_flag_evaluation_state(
+        &mut self,
+        flags: &[&FeatureFlag],
+    ) -> Result<(), FlagError> {
+        // Get cohorts first since we need the IDs
+        let cohorts = self.cohort_cache.get_cohorts(self.team_id).await?;
+        self.flag_evaluation_state.set_cohorts(cohorts.clone());
+
+        // Get static cohort IDs
+        let static_cohort_ids: Vec<CohortId> = cohorts
+            .iter()
+            .filter(|c| c.is_static)
+            .map(|c| c.id)
+            .collect();
+
+        // Then prepare group mappings and properties
+        // This should be _wicked_ fast since it's async and is just pulling from a cache that's already in memory
+        let group_timer = common_metrics::timing_guard(FLAG_GROUP_CACHE_FETCH_TIME, &[]);
+        let group_data = self.prepare_group_data(flags)?;
+        group_timer.fin();
+
+        // Single DB operation for properties and cohorts
+        let db_fetch_timer = common_metrics::timing_guard(FLAG_DB_PROPERTIES_FETCH_TIME, &[]);
+        match fetch_and_locally_cache_all_relevant_properties(
+            &mut self.flag_evaluation_state,
+            self.router.get_persons_reader().clone(),
+            self.distinct_id.clone(),
+            self.team_id,
+            &group_data.type_indexes,
+            &group_data.keys,
+            static_cohort_ids,
+        )
+        .await
+        {
+            Ok(_) => {
+                inc(DB_PERSON_AND_GROUP_PROPERTIES_READS_COUNTER, &[], 1);
+                db_fetch_timer.label("outcome", "success").fin();
+                Ok(())
+            }
+            Err(e) => {
+                error!(
+                    "Error fetching properties for team {} distinct_id {}: {:?}",
+                    self.team_id, self.distinct_id, e
+                );
+                db_fetch_timer.label("outcome", "error").fin();
+                Err(e)
+            }
+        }
+    }
+
+    /// Analyzes flags and prepares required group type data for flag evaluation.
+    /// This includes:
+    /// - Extracting required group type indexes from flags
+    /// - Mapping group names to group_type_index and group_keys
+    fn prepare_group_data(
+        &mut self,
+        flags: &[&FeatureFlag],
+    ) -> Result<GroupEvaluationData, FlagError> {
+        // Extract required group type indexes from flags
+        let type_indexes: HashSet<GroupTypeIndex> = flags
+            .iter()
+            .filter_map(|flag| flag.get_group_type_index())
+            .collect();
+
+        // Map group names to group_type_index and group_keys
+        let group_type_to_key_map: HashMap<GroupTypeIndex, String> = self
+            .groups
+            .iter()
+            .filter_map(|(group_type, group_key_value)| {
+                let group_key = match group_key_value {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    _ => return None, // Skip non-string, non-number group keys
+                };
+                self.group_type_mapping_cache
+                    .get_group_types_to_indexes()
+                    .ok()?
+                    .get(group_type)
+                    .cloned()
+                    .map(|group_type_index| (group_type_index, group_key))
+            })
+            .collect();
+
+        // Extract group_keys that are relevant to the required group_type_indexes
+        let keys: HashSet<String> = group_type_to_key_map
+            .iter()
+            .filter_map(|(group_type_index, group_key)| {
+                if type_indexes.contains(group_type_index) {
+                    Some(group_key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(GroupEvaluationData { type_indexes, keys })
+    }
+
+    /// Get person properties from the `FlagEvaluationState` only, returning empty HashMap if not found.
+    fn get_person_properties_from_evaluation_state(
+        &self,
+    ) -> Result<HashMap<String, Value>, FlagError> {
+        if let Some(properties) = self.flag_evaluation_state.get_person_properties() {
+            inc(
+                PROPERTY_CACHE_HITS_COUNTER,
+                &[("type".to_string(), "person_properties".to_string())],
+                1,
+            );
+            with_canonical_log(|log| log.eval.property_cache_hits += 1);
+            let mut result = HashMap::new();
+            result.clone_from(properties);
+            Ok(result)
+        } else {
+            inc(
+                PROPERTY_CACHE_MISSES_COUNTER,
+                &[("type".to_string(), "person_properties".to_string())],
+                1,
+            );
+            with_canonical_log(|log| {
+                log.eval.property_cache_misses += 1;
+                log.eval.person_properties_not_cached = true;
+            });
+            // Return empty HashMap instead of error - no properties is a valid state
+            // TODO probably worth error modeling empty cache vs error.
+            // Maybe an error is fine?  Idk.  I feel like the idea is that there's no matching properties,
+            // so it's not an error, it's just an empty result.
+            // i just want to be able to differentiate between no properties because we fetched no properties,
+            // and no properties because we failed to fetch
+            // maybe I need a fetch indicator in the cache?
+            tracing::warn!("Person properties not found in evaluation state cache");
+            Err(FlagError::PersonNotFound)
+        }
+    }
+
+    /// Get group properties for the given group type index from the `FlagEvaluationState` only. Returns empty HashMap if not found.
+    fn get_group_properties_from_evaluation_state(
+        &self,
+        group_type_index: GroupTypeIndex,
+    ) -> Result<HashMap<String, Value>, FlagError> {
+        let group_properties = self.flag_evaluation_state.get_group_properties();
+        if let Some(properties) = group_properties.get(&group_type_index) {
+            inc(
+                PROPERTY_CACHE_HITS_COUNTER,
+                &[("type".to_string(), "group_properties".to_string())],
+                1,
+            );
+            with_canonical_log(|log| log.eval.property_cache_hits += 1);
+            let mut result = HashMap::new();
+            result.clone_from(properties);
+            Ok(result)
+        } else {
+            inc(
+                PROPERTY_CACHE_MISSES_COUNTER,
+                &[("type".to_string(), "group_properties".to_string())],
+                1,
+            );
+            with_canonical_log(|log| {
+                log.eval.property_cache_misses += 1;
+                log.eval.group_properties_not_cached = true;
+            });
+            // Return empty HashMap instead of error - no properties is a valid state
+            Ok(HashMap::new())
+        }
+    }
+
+    /// If experience continuity is enabled, we need to process the hash key override.
+    /// See [`FeatureFlagMatcher::process_hash_key_override`] for more details.
+    async fn process_hash_key_override_if_needed(
+        &self,
+        flags_have_experience_continuity_enabled: bool,
+        hash_key_override: Option<String>,
+    ) -> (Option<HashMap<String, String>>, bool) {
+        let hash_key_timer = common_metrics::timing_guard(FLAG_HASH_KEY_PROCESSING_TIME, &[]);
+        let (hash_key_overrides, flag_hash_key_override_error) =
+            if flags_have_experience_continuity_enabled {
+                common_metrics::inc(FLAG_EXPERIENCE_CONTINUITY_REQUESTS_COUNTER, &[], 1);
+                match hash_key_override {
+                    Some(hash_key) => {
+                        let target_distinct_ids = vec![self.distinct_id.clone(), hash_key.clone()];
+                        self.process_hash_key_override(hash_key, target_distinct_ids)
+                            .await
+                    }
+                    // If no hash key override is provided, we need to look up existing overrides.
+                    // Most of the time this is fine because our client side sdks usually include $anon_distinct_id in their requests,
+                    // but if a customer is using hash key overrides across a client sdk and a server sdk then the experience
+                    // will be inconsistent because server sdks won't include $anon_distinct_id in their requests.
+                    // In addition, this behavior is consistent with /decide.
+                    None => {
+                        match get_feature_flag_hash_key_overrides(
+                            self.router.get_persons_reader().clone(),
+                            self.team_id,
+                            vec![self.distinct_id.clone()],
+                        )
+                        .await
+                        {
+                            Ok(overrides) => (Some(overrides), false),
+                            Err(e) => {
+                                error!(
+                                    "Failed to get feature flag hash key overrides for team {} distinct_id {}: {:?}",
+                                    self.team_id, self.distinct_id, e
+                                );
+                                (None, true)
+                            }
+                        }
+                    }
+                }
+            } else {
+                // if experience continuity is not enabled, we don't need to worry about hash key overrides
+                (None, false)
+            };
+
+        // If there was an error in processing hash key overrides, increment the error counter
+        if flag_hash_key_override_error {
+            let reason = "hash_key_override_error";
+            common_metrics::inc(
+                FLAG_EVALUATION_ERROR_COUNTER,
+                &[("reason".to_string(), reason.to_string())],
+                1,
+            );
+        }
+
+        hash_key_timer
+            .label(
+                "outcome",
+                if flag_hash_key_override_error {
+                    "error"
+                } else {
+                    "success"
+                },
+            )
+            .fin();
+
+        // Track hash key override status in canonical log
+        if flag_hash_key_override_error {
+            with_canonical_log(|log| log.hash_key_override_status = Some("error"));
+        } else if let Some(ref overrides) = hash_key_overrides {
+            let status = if overrides.is_empty() {
+                "empty"
+            } else {
+                "found"
+            };
+            with_canonical_log(|log| log.hash_key_override_status = Some(status));
+        }
+
+        (hash_key_overrides, flag_hash_key_override_error)
+    }
+
+    /// Initializes the group type mapping cache if needed.
+    ///
+    /// This function checks if any of the feature flags have group type indices and initializes the group type mapping cache if needed.
+    /// It returns a boolean indicating if there were any errors while initializing the group type mapping cache.
+    async fn initialize_group_type_mappings_if_needed(&mut self, flags: &[&FeatureFlag]) -> bool {
+        // Check if we need to fetch group type mappings – we have flags that use group properties (have group type indices)
+        let has_type_indexes = flags.iter().any(|flag| {
+            !self.filtered_out_flag_ids.contains(&flag.id) && flag.get_group_type_index().is_some()
+        });
+
+        if !has_type_indexes {
+            return false;
+        }
+
+        let group_type_mapping_timer = common_metrics::timing_guard(FLAG_GROUP_DB_FETCH_TIME, &[]);
+        let mut errors_while_computing_flags = false;
+
+        if self
+            .group_type_mapping_cache
+            .init(self.router.get_persons_reader().clone())
+            .await
+            .is_err()
+        {
+            errors_while_computing_flags = true;
+        }
+
+        group_type_mapping_timer
+            .label(
+                "outcome",
+                if errors_while_computing_flags {
+                    "error"
+                } else {
+                    "success"
+                },
+            )
+            .fin();
+
+        errors_while_computing_flags
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_promote_evaluation_type_none_to_sequential() {
+        assert_eq!(
+            EvaluationType::promote(None, EvaluationType::Sequential),
+            Some(EvaluationType::Sequential)
+        );
+    }
+
+    #[test]
+    fn test_promote_evaluation_type_none_to_parallel() {
+        assert_eq!(
+            EvaluationType::promote(None, EvaluationType::Parallel),
+            Some(EvaluationType::Parallel)
+        );
+    }
+
+    #[test]
+    fn test_promote_evaluation_type_sequential_to_parallel() {
+        assert_eq!(
+            EvaluationType::promote(Some(EvaluationType::Sequential), EvaluationType::Parallel),
+            Some(EvaluationType::Parallel)
+        );
+    }
+
+    #[test]
+    fn test_promote_evaluation_type_parallel_stays_sticky() {
+        assert_eq!(
+            EvaluationType::promote(Some(EvaluationType::Parallel), EvaluationType::Sequential),
+            Some(EvaluationType::Parallel)
+        );
+    }
+
+    #[test]
+    fn test_promote_evaluation_type_sequential_stays_sequential() {
+        assert_eq!(
+            EvaluationType::promote(Some(EvaluationType::Sequential), EvaluationType::Sequential),
+            Some(EvaluationType::Sequential)
+        );
+    }
+
+    #[test]
+    fn test_panic_fallback_preserves_flag_identity() {
+        let team_id = 42;
+        let snapshots = vec![
+            FlagSnapshot {
+                key: "flag_a".to_string(),
+                id: 10,
+                version: Some(3),
+            },
+            FlagSnapshot {
+                key: "flag_b".to_string(),
+                id: 20,
+                version: None,
+            },
+            FlagSnapshot {
+                key: "flag_c".to_string(),
+                id: 30,
+                version: Some(1),
+            },
+        ];
+
+        let results = FeatureFlagMatcher::build_panic_fallback(snapshots, team_id);
+
+        assert_eq!(results.len(), 3);
+
+        let (stub_a, err_a) = &results[0];
+        assert_eq!(stub_a.key, "flag_a");
+        assert_eq!(stub_a.id, 10);
+        assert_eq!(stub_a.version, Some(3));
+        assert!(matches!(err_a, Err(FlagError::BatchEvaluationPanicked)));
+
+        let (stub_b, err_b) = &results[1];
+        assert_eq!(stub_b.key, "flag_b");
+        assert_eq!(stub_b.id, 20);
+        assert_eq!(stub_b.version, None);
+        assert!(matches!(err_b, Err(FlagError::BatchEvaluationPanicked)));
+
+        let (stub_c, err_c) = &results[2];
+        assert_eq!(stub_c.key, "flag_c");
+        assert_eq!(stub_c.id, 30);
+        assert_eq!(stub_c.version, Some(1));
+        assert!(matches!(err_c, Err(FlagError::BatchEvaluationPanicked)));
+
+        for (stub, _) in &results {
+            assert_eq!(stub.team_id, team_id);
+            assert!(stub.active);
+            assert_eq!(stub.name, None);
+            assert!(!stub.deleted);
+            assert!(stub.filters.groups.is_empty());
+        }
+    }
+}

@@ -1,0 +1,1547 @@
+import uuid
+import datetime
+from enum import Enum
+from typing import Any, Literal, Optional
+from urllib.parse import quote
+
+from django.conf import settings
+from django.db.models import OuterRef, Subquery
+from django.utils import timezone
+
+import structlog
+import posthoganalytics
+from celery import shared_task
+from posthoganalytics import new_context, tag
+
+from posthog.batch_exports.models import BatchExportRun
+from posthog.caching.login_device_cache import check_and_cache_login_device
+from posthog.cloud_utils import is_cloud
+from posthog.constants import AUTH_BACKEND_DISPLAY_NAMES, INVITE_DAYS_VALIDITY
+from posthog.email import EMAIL_TASK_KWARGS, EmailMessage, is_email_available
+from posthog.event_usage import groups
+from posthog.geoip import get_geoip_properties
+from posthog.models import (
+    Organization,
+    OrganizationInvite,
+    OrganizationMembership,
+    PersonalAPIKey,
+    Plugin,
+    PluginConfig,
+    Team,
+    User,
+)
+from posthog.models.activity_logging.activity_log import ActivityLog
+from posthog.models.comment import Comment
+from posthog.models.comment.utils import build_comment_item_url
+from posthog.models.hog_functions.hog_function import HogFunction
+from posthog.models.utils import UUIDT
+from posthog.ph_client import get_client
+from posthog.user_permissions import UserPermissions
+
+from products.conversations.backend.models import Ticket
+from products.error_tracking.backend.models import ErrorTrackingIssueAssignment
+
+logger = structlog.get_logger(__name__)
+
+
+class NotificationSetting(Enum):
+    WEEKLY_PROJECT_DIGEST = "weekly_project_digest"
+    PLUGIN_DISABLED = "plugin_disabled"
+    ERROR_TRACKING_ISSUE_ASSIGNED = "error_tracking_issue_assigned"
+    ERROR_TRACKING_WEEKLY_DIGEST = "error_tracking_weekly_digest"
+    DISCUSSIONS_MENTIONED = "discussions_mentioned"
+    PROJECT_API_KEY_EXPOSED = "project_api_key_exposed"
+    MATERIALIZED_VIEW_SYNC_FAILED = "materialized_view_sync_failed"
+
+
+NotificationSettingType = Literal[
+    "weekly_project_digest",
+    "plugin_disabled",
+    "error_tracking_issue_assigned",
+    "error_tracking_weekly_digest",
+    "discussions_mentioned",
+    "project_api_key_exposed",
+    "materialized_view_sync_failed",
+]
+
+
+def send_message_to_all_staff_users(message: EmailMessage) -> None:
+    for user in User.objects.filter(is_active=True, is_staff=True):
+        message.add_user_recipient(user)
+
+    message.send()
+
+
+def get_members_to_notify(team: Team, notification_setting: NotificationSettingType) -> list[OrganizationMembership]:
+    memberships_to_email = []
+    memberships = OrganizationMembership.objects.prefetch_related("user", "organization").filter(
+        organization_id=team.organization_id
+    )
+    for membership in memberships:
+        if not should_send_notification(membership.user, notification_setting):
+            continue
+        team_permissions = UserPermissions(membership.user).team(team)
+        # Only send the email to users who have access to the affected project
+        # Those without access have `effective_membership_level` of `None`
+        if (
+            team_permissions.effective_membership_level_for_parent_membership(membership.organization, membership)
+            is not None
+        ):
+            memberships_to_email.append(membership)
+
+    return memberships_to_email
+
+
+def get_members_to_notify_for_pipeline_error(team: Team, failure_rate: float = 1.0) -> list[OrganizationMembership]:
+    """
+    Get members to notify for a data pipeline error, respecting threshold.
+
+    Args:
+        team: The team that owns the pipeline
+        failure_rate: The current failure rate (0.0 to 1.0). Defaults to 1.0 (100%) for single failures.
+
+    Returns:
+        List of organization memberships to notify
+    """
+    members_to_notify = get_members_to_notify(team, "plugin_disabled")
+
+    return [
+        member for member in members_to_notify if should_send_pipeline_error_notification(member.user, failure_rate)
+    ]
+
+
+def should_send_notification(
+    user: User,
+    notification_type: NotificationSettingType,
+    team_id: Optional[int] = None,
+) -> bool:
+    """
+    Determines if a notification should be sent to a user based on their notification settings.
+
+    Args:
+        user: The user to check settings for
+        notification_type: The type of notification being sent. It must be the enum member's value!
+        team_id: Optional team ID for team-specific notifications
+
+    Returns:
+        bool: True if the notification should be sent, False otherwise
+    """
+    settings = user.notification_settings
+
+    if notification_type == NotificationSetting.WEEKLY_PROJECT_DIGEST.value:
+        # First check global digest setting
+        if settings.get("all_weekly_digest_disabled", False):
+            return False
+
+        # Then check project-specific setting if team_id provided
+        if team_id is not None:
+            project_settings = settings.get("project_weekly_digest_disabled", {})
+            team_disabled = project_settings.get(str(team_id), False)
+            return not team_disabled
+
+        return True
+
+    # Default to True (enabled) if not set
+    elif notification_type == NotificationSetting.PLUGIN_DISABLED.value:
+        return settings.get(notification_type, True)
+
+    # Default to True (enabled) if not set
+    elif notification_type == NotificationSetting.ERROR_TRACKING_ISSUE_ASSIGNED.value:
+        return settings.get(notification_type, True)
+
+    elif notification_type == NotificationSetting.ERROR_TRACKING_WEEKLY_DIGEST.value:
+        if not settings.get(notification_type, True):
+            return False
+
+        if team_id is not None:
+            et_project_settings: dict[str, Any] | None = settings.get(
+                "error_tracking_weekly_digest_project_enabled", None
+            )
+            if et_project_settings is not None:
+                return et_project_settings.get(str(team_id), False)
+
+        return True
+
+    # Default to True (enabled) if not set
+    elif notification_type == NotificationSetting.DISCUSSIONS_MENTIONED.value:
+        return settings.get(notification_type, True)
+
+    elif notification_type == NotificationSetting.PROJECT_API_KEY_EXPOSED.value:
+        return settings.get(notification_type, True)
+
+    elif notification_type == NotificationSetting.MATERIALIZED_VIEW_SYNC_FAILED.value:
+        return settings.get(notification_type, False)
+
+    # The below typeerror is ignored because we're currently handling the notification
+    # types above, so technically it's unreachable. However if another is added but
+    # not handled in this function, we want this as a fallback.
+    return True  # type: ignore
+
+
+def should_send_pipeline_error_notification(
+    user: User,
+    failure_rate: float = 1.0,
+) -> bool:
+    """
+    Determines if a data pipeline error notification should be sent to a user.
+
+    Args:
+        user: The user to check settings for
+        failure_rate: The current failure rate (0.0 to 1.0) for this pipeline. Defaults to 1.0 (100%) for single failures.
+
+    Returns:
+        bool: True if the notification should be sent, False otherwise
+    """
+    settings = user.notification_settings
+
+    # Check threshold - if threshold is 0.0, notify on any failure
+    threshold = settings.get("data_pipeline_error_threshold", 0.0)
+    if threshold == 0.0:
+        return True
+
+    # If threshold > 0.0, only notify if failure rate exceeds threshold
+    return failure_rate > threshold
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_invite(invite_id: str) -> None:
+    campaign_key: str = f"invite_email_{invite_id}"
+    invite: OrganizationInvite = OrganizationInvite.objects.select_related("created_by", "organization").get(
+        id=invite_id
+    )
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=campaign_key,
+        subject=f"{invite.created_by.first_name} invited you to join {invite.organization.name} on PostHog",
+        template_name="invite",
+        template_context={
+            "invite": invite,
+            "expiry_date": (timezone.now() + datetime.timedelta(days=INVITE_DAYS_VALIDITY)).strftime(
+                "%B %d, %Y at %H:%M %Z"
+            ),
+            "inviter_first_name": invite.created_by.first_name if invite.created_by else "someone",
+            "organization_name": invite.organization.name,
+            "url": f"{settings.SITE_URL}/signup/{invite_id}",
+        },
+        reply_to=invite.created_by.email if invite.created_by and invite.created_by.email else "",
+    )
+    # Using invite_id that will be aliased to user.distinct_id after invite is accepted
+    message.add_recipient(email=invite.target_email, distinct_id=f"invite_{invite_id}")
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_member_join(invitee_uuid: str, organization_id: str) -> None:
+    invitee: User = User.objects.get(uuid=invitee_uuid)
+    organization: Organization = Organization.objects.get(id=organization_id)
+    campaign_key: str = f"member_join_email_org_{organization_id}_user_{invitee_uuid}"
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=campaign_key,
+        subject=f"{invitee.first_name} joined you on PostHog",
+        template_name="member_join",
+        template_context={
+            "invitee": invitee,
+            "organization": organization,
+            "invitee_first_name": invitee.first_name,
+            "organization_name": organization.name,
+        },
+    )
+    # Don't send this email to the new member themselves
+    members_to_email = organization.members.exclude(email=invitee.email)
+    if members_to_email:
+        for user in members_to_email:
+            message.add_user_recipient(user)
+        message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_password_reset(user_id: int, token: str) -> None:
+    user = User.objects.get(pk=user_id)
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"password-reset-{user.uuid}-{timezone.now().timestamp()}",
+        subject=f"Reset your PostHog password",
+        template_name="password_reset",
+        template_context={
+            "preheader": "Please follow the link inside to reset your password.",
+            "link": f"/reset/{user.uuid}/{token}",
+            "cloud": is_cloud(),
+            "site_url": settings.SITE_URL,
+            "social_providers": list(user.social_auth.values_list("provider", flat=True)),
+            "url": f"{settings.SITE_URL}/reset/{user.uuid}/{token}",
+        },
+    )
+    message.add_user_recipient(user)
+    message.send(send_async=False)
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_password_changed_email(user_id: int) -> None:
+    user = User.objects.get(pk=user_id)
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"password-changed-{user.uuid}-{timezone.now().timestamp()}",
+        subject="Your password has been changed",
+        template_name="password_changed",
+        template_context={
+            "preheader": "Your password has been changed",
+            "cloud": is_cloud(),
+            "site_url": settings.SITE_URL,
+        },
+    )
+    message.add_user_recipient(user)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_email_verification(user_id: int, token: str, next_url: str | None = None) -> None:
+    user: User = User.objects.get(pk=user_id)
+    next_query = f"?next={quote(next_url, safe='')}" if next_url else ""
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"email-verification-{user.uuid}-{timezone.now().timestamp()}",
+        subject=f"Verify your email address",
+        template_name="email_verification",
+        template_context={
+            "preheader": "Please follow the link inside to verify your account.",
+            "link": f"/verify_email/{user.uuid}/{token}{next_query}",
+            "site_url": settings.SITE_URL,
+            "url": f"{settings.SITE_URL}/verify_email/{user.uuid}/{token}{next_query}",
+        },
+    )
+    message.add_user_recipient(user, email_override=user.pending_email)
+    message.send(send_async=False)
+    posthoganalytics.capture(
+        distinct_id=str(user.distinct_id),
+        event="verification email sent",
+        groups={"organization": str(user.current_organization.id)},  # type: ignore
+    )
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_email_mfa_link(user_id: int, token: str) -> None:
+    """Send email MFA verification link"""
+    user: User = User.objects.get(pk=user_id)
+
+    verification_link = f"{settings.SITE_URL}/login/verify?email={quote(user.email)}&token={token}"
+
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"email_mfa_{user.uuid}-{timezone.now().timestamp()}",
+        subject="Verify your PostHog login",
+        template_name="email_mfa_link",
+        template_context={
+            "preheader": "Please follow the link inside to verify your login.",
+            "url": verification_link,
+            "expiration_minutes": 10,
+            "site_url": settings.SITE_URL,
+        },
+    )
+    message.add_user_recipient(user)
+    message.send(send_async=False)
+    posthoganalytics.capture(
+        distinct_id=str(user.distinct_id),
+        event="email mfa link sent",
+        groups={"organization": str(user.current_organization.id)},  # type: ignore
+    )
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_fatal_plugin_error(
+    plugin_config_id: int,
+    plugin_config_updated_at: Optional[str],
+    error: str,
+    is_system_error: bool,
+) -> None:
+    if not is_email_available(with_absolute_urls=True):
+        return
+    plugin_config: PluginConfig = PluginConfig.objects.prefetch_related("plugin", "team").get(id=plugin_config_id)
+    plugin: Plugin = plugin_config.plugin
+    team: Team = plugin_config.team
+
+    memberships_to_email = get_members_to_notify_for_pipeline_error(team, failure_rate=1.0)
+    if not memberships_to_email:
+        return
+
+    campaign_key: str = f"plugin_disabled_email_plugin_config_{plugin_config_id}_updated_at_{plugin_config_updated_at}"
+    message = EmailMessage(
+        campaign_key=campaign_key,
+        subject=f"[Alert] {plugin} has been disabled in project {team} due to a fatal error",
+        template_name="fatal_plugin_error",
+        template_context={
+            "plugin": plugin,
+            "team": team,
+            "error": error,
+            "is_system_error": is_system_error,
+        },
+    )
+    for membership in memberships_to_email:
+        message.add_user_recipient(membership.user)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_hog_function_disabled(hog_function_id: str) -> None:
+    if not is_email_available(with_absolute_urls=True):
+        return
+    hog_function: HogFunction = HogFunction.objects.prefetch_related("team").get(id=hog_function_id)
+    team = hog_function.team
+
+    memberships_to_email = get_members_to_notify_for_pipeline_error(team, failure_rate=1.0)
+    if not memberships_to_email:
+        return
+
+    campaign_key: str = f"hog_function_disabled_{hog_function_id}_updated_at_{hog_function.updated_at.timestamp()}"
+    message = EmailMessage(
+        campaign_key=campaign_key,
+        subject=f"[Alert] Destination '{hog_function.name}' has been disabled in project '{team}' due to high error rate",
+        template_name="hog_function_disabled",
+        template_context={"hog_function": hog_function, "team": team},
+    )
+    for membership in memberships_to_email:
+        message.add_user_recipient(membership.user)
+    message.send()
+
+
+def send_batch_export_run_failure(
+    batch_export_run_id: str | UUIDT,
+    failure_rate: float = 1.0,
+) -> None:
+    logger = structlog.get_logger(__name__)
+
+    is_email_available_result = is_email_available(with_absolute_urls=True)
+    if not is_email_available_result:
+        logger.warning("Email service is not available")
+        return None
+
+    batch_export_run: BatchExportRun = BatchExportRun.objects.select_related("batch_export__team").get(
+        id=batch_export_run_id
+    )
+    team: Team = batch_export_run.batch_export.team
+
+    memberships_to_email = get_members_to_notify_for_pipeline_error(team, failure_rate)
+    if not memberships_to_email:
+        return
+
+    logger.info("Preparing notification email for batch export run %s", batch_export_run_id)
+
+    # NOTE: We are taking only the date component to cap the number of emails at one per day per batch export.
+    last_updated_at_date = batch_export_run.last_updated_at.strftime("%Y-%m-%d")
+
+    campaign_key: str = (
+        f"batch_export_run_email_batch_export_{batch_export_run.batch_export.id}_last_updated_at_{last_updated_at_date}"
+    )
+
+    message = EmailMessage(
+        campaign_key=campaign_key,
+        subject=f"PostHog: {batch_export_run.batch_export.name} batch export run failure",
+        template_name="batch_export_run_failure",
+        template_context={
+            "time": batch_export_run.last_updated_at.strftime("%I:%M%p %Z on %B %d"),
+            "team": team,
+            "id": batch_export_run.batch_export.id,
+            "name": batch_export_run.batch_export.name,
+        },
+    )
+    logger.info("Prepared notification email for campaign %s", campaign_key)
+
+    for membership in memberships_to_email:
+        message.add_user_recipient(membership.user)
+    message.send()
+
+
+def send_saved_query_materialization_failure(saved_query_id: str) -> None:
+    """Send email notification when a materialized view sync fails."""
+    from products.data_warehouse.backend.models import DataWarehouseSavedQuery
+
+    if not is_email_available(with_absolute_urls=True):
+        logger.warning("Email service is not available for materialization failure notification")
+        return
+
+    try:
+        saved_query = DataWarehouseSavedQuery.objects.select_related("team").get(id=saved_query_id)
+    except DataWarehouseSavedQuery.DoesNotExist:
+        logger.warning("Saved query %s not found for materialization failure notification", saved_query_id)
+        return
+
+    team: Team = saved_query.team
+
+    memberships_to_email = get_members_to_notify(team, NotificationSetting.MATERIALIZED_VIEW_SYNC_FAILED.value)
+    if not memberships_to_email:
+        return
+
+    logger.info("Preparing materialization failure notification email for saved query %s", saved_query_id)
+
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    campaign_key = f"saved_query_materialization_failure_{saved_query_id}_{today}"
+
+    message = EmailMessage(
+        campaign_key=campaign_key,
+        subject=f"PostHog: Materialized view '{saved_query.name}' sync failed",
+        template_name="saved_query_materialization_failure",
+        template_context={
+            "team": team,
+            "saved_query_id": str(saved_query.id),
+            "saved_query_name": saved_query.name,
+        },
+    )
+
+    for membership in memberships_to_email:
+        message.add_user_recipient(membership.user)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_canary_email(user_email: str) -> None:
+    message = EmailMessage(
+        campaign_key=f"canary_email_{uuid.uuid4()}",
+        subject="This is a test email of your PostHog instance",
+        template_name="canary_email",
+        template_context={"site_url": settings.SITE_URL},
+    )
+    message.add_recipient(email=user_email)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_email_change_emails(now_iso: str, user_name: str, old_address: str, new_address: str) -> None:
+    message_old_address = EmailMessage(
+        use_http=True,
+        campaign_key=f"email_change_old_address_{now_iso}",
+        subject="This is no longer your PostHog account email",
+        template_name="email_change_old_address",
+        template_context={
+            "user_name": user_name,
+            "old_address": old_address,
+            "new_address": new_address,
+        },
+    )
+    message_new_address = EmailMessage(
+        use_http=True,
+        campaign_key=f"email_change_new_address_{now_iso}",
+        subject="This is your new PostHog account email",
+        template_name="email_change_new_address",
+        template_context={
+            "user_name": user_name,
+            "old_address": old_address,
+            "new_address": new_address,
+        },
+    )
+    message_old_address.add_recipient(email=old_address)
+    message_new_address.add_recipient(email=new_address)
+    message_old_address.send()
+    message_new_address.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_async_migration_complete_email(migration_key: str, time: str) -> None:
+    message = EmailMessage(
+        campaign_key=f"async_migration_complete_{migration_key}",
+        subject=f"Async migration {migration_key} completed",
+        template_name="async_migration_status",
+        template_context={
+            "migration_status_update": f"Async migration {migration_key} completed successfully at {time}."
+        },
+    )
+
+    send_message_to_all_staff_users(message)
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_async_migration_errored_email(migration_key: str, time: str, error: str) -> None:
+    message = EmailMessage(
+        campaign_key=f"async_migration_error_{migration_key}",
+        subject=f"Async migration {migration_key} errored",
+        template_name="async_migration_error",
+        template_context={"migration_key": migration_key, "time": time, "error": error},
+    )
+
+    send_message_to_all_staff_users(message)
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_two_factor_auth_enabled_email(user_id: int) -> None:
+    user: User = User.objects.get(pk=user_id)
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"2fa_enabled_{user.uuid}-{timezone.now().timestamp()}",
+        template_name="2fa_enabled",
+        subject="You've enabled 2FA protection",
+        template_context={
+            "user_name": user.first_name,
+            "user_email": user.email,
+        },
+    )
+    message.add_user_recipient(user)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_two_factor_auth_disabled_email(user_id: int) -> None:
+    user: User = User.objects.get(pk=user_id)
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"2fa_disabled_{user.uuid}-{timezone.now().timestamp()}",
+        template_name="2fa_disabled",
+        subject="You've disabled 2FA protection",
+        template_context={
+            "user_name": user.first_name,
+            "user_email": user.email,
+        },
+    )
+    message.add_user_recipient(user)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_passkey_added_email(user_id: int) -> None:
+    user: User = User.objects.get(pk=user_id)
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"passkey_added_{user.uuid}-{timezone.now().timestamp()}",
+        template_name="passkey_added",
+        subject="A passkey was added to your account",
+        template_context={
+            "user_name": user.first_name,
+            "user_email": user.email,
+        },
+    )
+    message.add_user_recipient(user)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_passkey_removed_email(user_id: int) -> None:
+    user: User = User.objects.get(pk=user_id)
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"passkey_removed_{user.uuid}-{timezone.now().timestamp()}",
+        template_name="passkey_removed",
+        subject="A passkey was removed from your account",
+        template_context={
+            "user_name": user.first_name,
+            "user_email": user.email,
+        },
+    )
+    message.add_user_recipient(user)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_two_factor_auth_backup_code_used_email(user_id: int) -> None:
+    user: User = User.objects.get(pk=user_id)
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"2fa_backup_code_used_{user.uuid}-{timezone.now().timestamp()}",
+        template_name="2fa_backup_code_used",
+        subject="A backup code was used for your account",
+        template_context={
+            "user_name": user.first_name,
+            "user_email": user.email,
+        },
+    )
+    message.add_user_recipient(user)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_two_factor_reset_email(user_id: int, token: str) -> None:
+    """Send 2FA reset email to user when an admin initiates a reset."""
+    user: User = User.objects.get(pk=user_id)
+
+    reset_link = f"{settings.SITE_URL}/reset_2fa/{user.uuid}/{token}"
+
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"2fa_reset_{user.uuid}-{timezone.now().timestamp()}",
+        subject="Reset your two-factor authentication",
+        template_name="2fa_reset",
+        template_context={
+            "preheader": "An administrator has initiated a 2FA reset for your account.",
+            "user_name": user.first_name,
+            "user_email": user.email,
+            "url": reset_link,
+            "expiration_hours": 1,
+            "site_url": settings.SITE_URL,
+        },
+    )
+    message.add_user_recipient(user)
+    message.send(send_async=False)
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def login_from_new_device_notification(
+    user_id: int, login_time: datetime.datetime, short_user_agent: str, ip_address: str, backend_name: str
+) -> None:
+    """Send login notification email if login is from a new device"""
+    if not is_email_available(with_absolute_urls=True):
+        return
+
+    user: User = User.objects.get(pk=user_id)
+
+    # Send email if feature flag is enabled or in tests
+    if settings.TEST:
+        enabled = True
+    elif user.current_organization is None:
+        enabled = False
+    else:
+        enabled = posthoganalytics.feature_enabled(
+            key="login-from-new-device-notification",
+            distinct_id=str(user.distinct_id),
+            groups={"organization": str(user.current_organization.id)},
+        )
+
+    if not enabled:
+        return
+
+    login_time_str = login_time.strftime("%B %-d, %Y at %H:%M UTC")
+    geoip_properties = get_geoip_properties(ip_address)
+    country = geoip_properties.get("$geoip_country_name", "Unknown")
+    city = geoip_properties.get("$geoip_city_name", "Unknown")
+
+    login_method = AUTH_BACKEND_DISPLAY_NAMES.get(backend_name, "Unknown")
+
+    is_new_device = check_and_cache_login_device(user_id, country, short_user_agent)
+    if not is_new_device:
+        return
+
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"login_notification_{user.uuid}-{timezone.now().timestamp()}",
+        template_name="login_notification",
+        subject="A new device logged into your account",
+        template_context={
+            "login_time": login_time_str,
+            "ip_address": ip_address,
+            "location": country,
+            "browser": short_user_agent,
+            "login_method": login_method,
+        },
+    )
+    message.add_user_recipient(user)
+    message.send()
+
+    # Capture event using ph_client for reliability in Celery tasks
+    ph_client = get_client()
+    ph_client.capture(
+        distinct_id=str(user.distinct_id),
+        event="login notification sent",
+        properties={
+            "ip_address": ip_address,
+            "geoip_country": country,
+            "geoip_city": city,
+            "short_user_agent": short_user_agent,
+            "login_method": login_method,
+        },
+        groups=groups(user.current_organization, user.current_team),
+    )
+    ph_client.shutdown()
+
+
+def get_users_for_orgs_with_no_ingested_events(
+    org_created_from: datetime.datetime, org_created_to: datetime.datetime
+) -> list[User]:
+    # Get all users for organization that haven't ingested any events
+    users = []
+    recently_created_organizations = Organization.objects.filter(
+        created_at__gte=org_created_from, created_at__lte=org_created_to
+    )
+
+    for organization in recently_created_organizations:
+        orgs_teams = Team.objects.filter(organization=organization)
+        have_ingested = orgs_teams.filter(ingested_event=True).exists()
+        if not have_ingested:
+            users.extend(organization.members.all())
+    return users
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_error_tracking_issue_assigned(assignment_id: str, assigner_id: int) -> None:
+    assignment = ErrorTrackingIssueAssignment.objects.select_related("issue__team", "user", "role").get(
+        id=assignment_id
+    )
+    assigner = User.objects.get(pk=assigner_id)
+
+    if not is_email_available(with_absolute_urls=True):
+        return
+
+    team = assignment.issue.team
+    memberships_to_email = get_members_to_notify(team, NotificationSetting.ERROR_TRACKING_ISSUE_ASSIGNED.value)
+    if not memberships_to_email:
+        return
+
+    # Filter the memberships list to only include users assigned
+    if assignment.user:
+        memberships_to_email = [
+            membership
+            for membership in memberships_to_email
+            if (membership.user == assignment.user and membership.user != assigner)
+        ]
+    elif assignment.role:
+        role_users = assignment.role.members.all()
+        memberships_to_email = [
+            membership
+            for membership in memberships_to_email
+            if (membership.user in role_users and membership.user != assigner)
+        ]
+
+    campaign_key: str = f"error_tracking_issue_assigned_{assignment.id}_updated_at_{assignment.created_at.timestamp()}"
+    message = EmailMessage(
+        campaign_key=campaign_key,
+        subject=f"[Issue]: {assignment.issue.name} assigned to you in project '{team}'",
+        template_name="error_tracking_issue_assigned",
+        template_context={
+            "assigner": assigner,
+            "assignment": assignment,
+            "team": team,
+            "site_url": settings.SITE_URL,
+        },
+    )
+    for membership in memberships_to_email:
+        message.add_user_recipient(membership.user)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_discussions_mentioned(comment_id: str, mentioned_user_ids: list[int], slug: str) -> None:
+    with new_context():
+        tag("task", "send_discussions_mentioned")
+
+        comment = Comment.objects.select_related("created_by", "team").get(id=comment_id)
+
+        if not is_email_available(with_absolute_urls=True):
+            logger.warning("Skipping discussions mentioned email: email service not available")
+            return
+
+        team = comment.team
+        commenter = comment.created_by
+        memberships_to_email = get_members_to_notify(team, NotificationSetting.DISCUSSIONS_MENTIONED.value)
+
+        if not commenter:
+            logger.warning("Skipping discussions mentioned email: no commenter")
+            return
+
+        if not memberships_to_email:
+            logger.warning("Skipping discussions mentioned email: no members mentioned")
+            return
+
+        # Filter the memberships list to only include users mentioned
+        memberships_to_email = [
+            membership
+            for membership in memberships_to_email
+            if (membership.user.id in mentioned_user_ids and membership.user != commenter)
+        ]
+
+        if not memberships_to_email:
+            logger.warning("Skipping discussions mentioned email: no valid recipients after filtering")
+            return
+
+        href = build_comment_item_url(comment.scope, comment.item_id, slug)
+
+        campaign_key: str = f"discussions_user_mentioned_{comment.id}_updated_at_{comment.created_at.timestamp()}"
+        message = EmailMessage(
+            campaign_key=campaign_key,
+            subject=f"[Discussions]: {commenter.first_name} mentioned you in project '{team}'",
+            template_name="discussions_mentioned",
+            template_context={
+                "commenter": commenter,
+                "content": comment.content,
+                "team": team,
+                "href": href,
+            },
+        )
+
+        logger.info(f"Sending discussions mentioned email for comment ({comment.id})")
+
+        for membership in memberships_to_email:
+            message.add_user_recipient(membership.user)
+        message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_hog_functions_digest_email(digest_data: dict, test_email_override: str | None = None) -> None:
+    if not is_email_available(with_absolute_urls=True):
+        return
+
+    team_id = digest_data["team_id"]
+
+    try:
+        team = Team.objects.get(id=team_id)
+    except Team.DoesNotExist:
+        logger.exception(f"Team {team_id} not found for HogFunctions digest email")
+        return
+
+    # Get members to email
+    memberships_to_email = get_members_to_notify(team, "plugin_disabled")
+    if not memberships_to_email:
+        return
+
+    # If test email override is provided, validate it early
+    if test_email_override:
+        test_membership = None
+        for membership in memberships_to_email:
+            if membership.user.email == test_email_override:
+                test_membership = membership
+                break
+
+        if not test_membership:
+            logger.warning(
+                f"Test email override {test_email_override} not found in organization memberships for team {team_id}"
+            )
+            return
+
+        # For testing: use only the override recipient
+        memberships_to_email = [test_membership]
+        logger.info(f"Sending test HogFunctions digest email to {test_email_override}")
+
+    all_functions = digest_data["functions"]
+    date_suffix = timezone.now().strftime("%Y-%m-%d")
+    emails_sent = 0
+
+    # Send a unique email to each member with functions filtered by their threshold
+    for membership in memberships_to_email:
+        user = membership.user
+
+        # Filter functions based on user's threshold
+        # failure_rate is stored as a percentage (e.g., 15.5 for 15.5%), convert to decimal for threshold check
+        user_functions = [
+            f
+            for f in all_functions
+            if should_send_pipeline_error_notification(user, float(f.get("failure_rate", 0) or 0) / 100)
+        ]
+
+        # Skip this user if no functions exceed their threshold
+        if len(user_functions) == 0:
+            continue
+
+        # Sort functions by failure rate descending (highest first)
+        sorted_functions = sorted(user_functions, key=lambda x: float(x.get("failure_rate", 0) or 0), reverse=True)
+
+        campaign_key = f"hog_functions_daily_digest_{team_id}_{user.uuid}_{date_suffix}"
+
+        message = EmailMessage(
+            campaign_key=campaign_key,
+            subject=f"Data Pipeline Failures Alert for {team.name}",
+            template_name="hog_functions_daily_digest",
+            template_context={
+                "team": team,
+                "functions": sorted_functions,
+                "site_url": settings.SITE_URL,
+            },
+        )
+
+        message.add_user_recipient(user)
+        message.send()
+        emails_sent += 1
+
+    logger.info(f"Sent HogFunctions digest email to {emails_sent} members for team {team_id}")
+
+
+@shared_task(ignore_result=True)
+def send_hog_functions_daily_digest() -> None:
+    """
+    Send daily digest email to teams with HogFunctions that have failures.
+    Queries ClickHouse first to find failures, then fans out to team-specific tasks.
+    """
+    from posthog.clickhouse.client import sync_execute
+
+    logger.info("Starting HogFunctions daily digest task")
+
+    # Query ClickHouse to find all teams with failures and their hog_function_ids
+    failures_query = """
+    SELECT DISTINCT team_id, app_source_id as hog_function_id
+    FROM app_metrics2
+    WHERE app_source = 'hog_function'
+    AND metric_name = 'failed'
+    AND count > 0
+    AND timestamp >= NOW() - INTERVAL 24 HOUR
+    AND timestamp < NOW()
+    AND metric_kind = 'failure'
+    """
+
+    failed_teams_data = sync_execute(failures_query, {})
+
+    if not failed_teams_data:
+        logger.info("No HogFunctions with failures found")
+        return
+
+    # Group hog_function_ids by team_id
+    teams_with_functions: dict[int, set[str]] = {}
+    for row in failed_teams_data:
+        team_id, hog_function_id = row
+        if team_id not in teams_with_functions:
+            teams_with_functions[team_id] = set()
+        teams_with_functions[team_id].add(str(hog_function_id))
+
+    team_ids = list(teams_with_functions.keys())
+
+    # Filter teams based on the feature flag setting
+    allowed_team_ids = settings.HOG_FUNCTIONS_DAILY_DIGEST_TEAM_IDS
+    if allowed_team_ids and "*" not in allowed_team_ids:
+        # Convert string team IDs to integers for comparison
+        allowed_team_ids_int = [int(team_id) for team_id in allowed_team_ids]
+        team_ids = [team_id for team_id in team_ids if team_id in allowed_team_ids_int]
+        logger.info(f"Filtered to {len(team_ids)} teams based on HOG_FUNCTIONS_DAILY_DIGEST_TEAM_IDS setting")
+
+    if not team_ids:
+        logger.info("No teams in allowed list have HogFunctions with failures")
+        return
+
+    logger.info(f"Found {len(team_ids)} teams with HogFunction failures")
+
+    # Fan out to team-specific tasks
+    for team_id in team_ids:
+        hog_function_ids = list(teams_with_functions[team_id])
+        send_team_hog_functions_digest.delay(team_id, hog_function_ids)
+        logger.info(f"Scheduled digest for team {team_id} with {len(hog_function_ids)} functions")
+
+    logger.info("Completed HogFunctions daily digest task")
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_team_hog_functions_digest(team_id: int, hog_function_ids: list[str] | None = None) -> None:
+    """
+    Send daily digest email for a specific team with their failed HogFunctions.
+
+    Args:
+        team_id: The team ID to process
+        hog_function_ids: Optional list of specific hog function IDs to process
+    """
+    from posthog.clickhouse.client import sync_execute
+    from posthog.models.hog_functions.hog_function import HogFunction
+
+    logger.info(f"Processing HogFunctions digest for team {team_id}")
+
+    # Get metrics data from ClickHouse for all functions in the team
+    metrics_query = """
+    SELECT
+        app_source_id as hog_function_id,
+        metric_name,
+        sum(count) as total_count
+    FROM app_metrics2
+    WHERE team_id = %(team_id)s
+    AND app_source = 'hog_function'
+    AND timestamp >= NOW() - INTERVAL 24 HOUR
+    AND timestamp < NOW()
+    AND metric_name IN ('succeeded', 'failed')
+    {hog_function_filter}
+    GROUP BY app_source_id, metric_name
+    HAVING total_count > 0
+    ORDER BY app_source_id, metric_name
+    """
+
+    # Add filter for specific hog_function_ids if provided
+    hog_function_filter = ""
+    query_params: dict[str, int | list[str]] = {"team_id": team_id}
+
+    if hog_function_ids:
+        hog_function_filter = "AND app_source_id IN %(hog_function_ids)s"
+        query_params["hog_function_ids"] = hog_function_ids
+
+    final_query = metrics_query.format(hog_function_filter=hog_function_filter)
+
+    metrics_data = sync_execute(
+        final_query,
+        query_params,
+    )
+
+    if not metrics_data:
+        logger.info(f"No functions with metrics found for team {team_id}")
+        return
+
+    # Group metrics by hog_function_id
+    metrics_by_function = {}
+    for row in metrics_data:
+        hog_function_id, metric_name, count = str(row[0]), row[1], row[2]
+        if hog_function_id not in metrics_by_function:
+            metrics_by_function[hog_function_id] = {"succeeded": 0, "failed": 0}
+        metrics_by_function[hog_function_id][metric_name] = count
+
+    # Only include functions that have failures
+    failed_function_ids = [fid for fid, metrics in metrics_by_function.items() if metrics["failed"] > 0]
+
+    if not failed_function_ids:
+        logger.info(f"No functions with failures found for team {team_id}")
+        return
+
+    # Get all active HogFunctions for the team that had failures
+    hog_functions = (
+        HogFunction.objects.filter(team_id=team_id, enabled=True, deleted=False, id__in=failed_function_ids)
+        .select_related("created_by")
+        .values("id", "team_id", "name", "type", "created_by__email")
+    )
+
+    if not hog_functions:
+        logger.info(f"No active HogFunctions found for team {team_id}")
+        return
+
+    # Get the last editor for each HogFunction from activity log
+    hog_function_ids_list = [str(hf["id"]) for hf in hog_functions]
+    last_editors: dict[str, str | None] = {}
+    last_edit_dates: dict[str, str | None] = {}
+
+    # Use a subquery to get only the latest activity for each HogFunction
+    latest_activities_subquery = (
+        ActivityLog.objects.filter(team_id=team_id, scope="HogFunction", item_id=OuterRef("item_id"))
+        .order_by("-created_at")
+        .values("id")[:1]
+    )
+
+    latest_activities = ActivityLog.objects.select_related("user").filter(
+        team_id=team_id,
+        scope="HogFunction",
+        item_id__in=hog_function_ids_list,
+        id__in=Subquery(latest_activities_subquery),
+    )
+
+    # Build the dictionaries from the optimized result set
+    for activity in latest_activities:
+        if activity.item_id is not None:  # Ensure item_id is not None before using as dict key
+            if activity.user:
+                last_editors[activity.item_id] = activity.user.email
+                last_edit_dates[activity.item_id] = activity.created_at.strftime("%Y-%m-%d")
+            else:
+                last_editors[activity.item_id] = None
+                last_edit_dates[activity.item_id] = None
+
+    # Ensure all HogFunctions have entries (even if no activity log exists)
+    for hog_function_id in hog_function_ids_list:
+        if hog_function_id not in last_editors:
+            last_editors[hog_function_id] = None
+            last_edit_dates[hog_function_id] = None
+
+    # Build function metrics. Only include functions with at least one failure; per-user threshold
+    # (data_pipeline_error_threshold) then filters which functions each user sees in send_hog_functions_digest_email.
+    function_metrics = []
+    for hog_function in hog_functions:
+        hog_function_id = str(hog_function["id"])
+        if hog_function_id not in metrics_by_function:
+            continue
+
+        metrics = metrics_by_function[hog_function_id]
+        if metrics["failed"] <= 0:
+            continue
+
+        total_runs = metrics["succeeded"] + metrics["failed"]
+        failure_rate = (metrics["failed"] / total_runs * 100) if total_runs > 0 else 0
+
+        function_info = {
+            "id": hog_function_id,
+            "name": hog_function["name"],
+            "type": hog_function["type"],
+            "created_by_email": hog_function["created_by__email"],
+            "last_edited_by_email": last_editors.get(hog_function_id),
+            "last_edit_date": last_edit_dates.get(hog_function_id),
+            "succeeded": metrics["succeeded"],
+            "failed": metrics["failed"],
+            "failure_rate": round(failure_rate, 1),
+            "url": f"{settings.SITE_URL}/project/{team_id}/pipeline/destinations/hog-{hog_function_id}",
+        }
+        function_metrics.append(function_info)
+
+    if not function_metrics:
+        logger.info(f"No functions with failures found for team {team_id}")
+        return
+
+    # Sort by failure rate descending (highest failure rate first)
+    function_metrics.sort(key=lambda x: x["failure_rate"] or 0, reverse=True)
+
+    # Prepare data for email
+    digest_data = {
+        "team_id": team_id,
+        "functions": function_metrics,
+    }
+
+    send_hog_functions_digest_email.delay(digest_data)
+    logger.info(f"Scheduled HogFunctions digest email for team {team_id} with {len(function_metrics)} failed functions")
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_personal_api_key_exposed(user_id: int, personal_api_key_id: str, old_mask_value: str, more_info: str) -> None:
+    if not is_email_available(with_absolute_urls=True):
+        return
+
+    user = User.objects.get(pk=user_id)
+    personal_api_key = PersonalAPIKey.objects.get(id=personal_api_key_id)
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"personal-api-key-exposed-{user.uuid}-{timezone.now().timestamp()}",
+        subject="Personal API Key has been deactivated",
+        template_name="personal_api_key_exposed",
+        template_context={
+            "preheader": "Personal API Key has been deactivated",
+            "label": personal_api_key.label,
+            "more_info": more_info,
+            "mask_value": old_mask_value,
+            "url": f"{settings.SITE_URL}/settings/user-api-keys",
+        },
+    )
+    message.add_user_recipient(user)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_project_secret_api_key_exposed(team_id: int, mask_value: str, more_info: str) -> None:
+    if not is_email_available(with_absolute_urls=True):
+        return
+
+    team = Team.objects.select_related("organization").get(pk=team_id)
+    memberships_to_email = get_members_to_notify(team, NotificationSetting.PROJECT_API_KEY_EXPOSED.value)
+
+    # Filter to admins since they can rotate keys
+    memberships_to_email = [m for m in memberships_to_email if m.level >= OrganizationMembership.Level.ADMIN]
+
+    if not memberships_to_email:
+        return
+
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"project-secret-api-key-exposed-{team.uuid}-{timezone.now().timestamp()}",
+        # TODO rename when Project Secret API Keys are launched
+        # subject=f"Project secret API key has been exposed for {team.name}",
+        subject=f"Feature Flags Secure API key has been exposed for {team.name}",
+        template_name="project_secret_api_key_exposed",
+        template_context={
+            # "preheader": "Project secret API key has been exposed",
+            "preheader": "Feature Flags Secure API key has been exposed",
+            "project_name": team.name,
+            "more_info": more_info,
+            "mask_value": mask_value,
+            "url": f"{settings.SITE_URL}/project/{team.pk}/settings/project-feature-flags",
+        },
+    )
+    for membership in memberships_to_email:
+        message.add_user_recipient(membership.user)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_oauth_token_exposed(user_id: int, token_type: str, mask_value: str, more_info: str) -> None:
+    if not is_email_available(with_absolute_urls=True):
+        return
+
+    user = User.objects.get(pk=user_id)
+    token_type_display = "OAuth access token" if token_type == "access" else "OAuth refresh token"
+
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"oauth-token-exposed-{user.uuid}-{timezone.now().timestamp()}",
+        subject=f"{token_type_display} has been revoked",
+        template_name="oauth_token_exposed",
+        template_context={
+            "preheader": f"{token_type_display} has been revoked",
+            "token_type": token_type_display,
+            "more_info": more_info,
+            "mask_value": mask_value,
+            "url": f"{settings.SITE_URL}/settings/user-api-keys",
+        },
+    )
+    message.add_user_recipient(user)
+    message.send()
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_new_ticket_notification(ticket_id: str, team_id: int, first_message_content: str) -> None:
+    if not is_email_available(with_absolute_urls=True):
+        logger.warning("Skipping new ticket notification: email service not available")
+        return
+
+    try:
+        team = Team.objects.get(pk=team_id)
+        ticket = Ticket.objects.get(id=ticket_id, team=team)
+    except (Team.DoesNotExist, Ticket.DoesNotExist):
+        logger.warning(f"Skipping new ticket notification: ticket or team not found (ticket_id={ticket_id})")
+        return
+
+    # Get notification recipients from team settings
+    conversations_settings = team.conversations_settings or {}
+    recipient_ids = conversations_settings.get("notification_recipients", [])
+
+    if not recipient_ids:
+        return
+
+    # Get users who should receive notifications and have access to the project
+    memberships = OrganizationMembership.objects.prefetch_related("user", "organization").filter(
+        organization_id=team.organization_id,
+        user_id__in=recipient_ids,
+    )
+
+    memberships_to_email = []
+    for membership in memberships:
+        team_permissions = UserPermissions(membership.user).team(team)
+        if (
+            team_permissions.effective_membership_level_for_parent_membership(membership.organization, membership)
+            is not None
+        ):
+            memberships_to_email.append(membership)
+
+    if not memberships_to_email:
+        return
+
+    # Extract customer info from anonymous_traits
+    traits = ticket.anonymous_traits or {}
+    customer_name = traits.get("name")
+    customer_email = traits.get("email")
+
+    ticket_url = f"{settings.SITE_URL}/project/{team.pk}/conversations/tickets/{ticket.id}"
+
+    campaign_key = f"new_conversation_ticket_{ticket.id}"
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=campaign_key,
+        subject=f"[Ticket #{ticket.ticket_number}] New support ticket in {team.name}",
+        template_name="new_conversation_ticket",
+        template_context={
+            "team_name": team.name,
+            "ticket_number": ticket.ticket_number,
+            "customer_name": customer_name,
+            "customer_email": customer_email,
+            "first_message": first_message_content[:500] if first_message_content else "",
+            "ticket_url": ticket_url,
+        },
+    )
+
+    for membership in memberships_to_email:
+        message.add_user_recipient(membership.user)
+
+    message.send()
+    logger.info(f"Sent new ticket notification for ticket {ticket.id} to {len(memberships_to_email)} recipients")
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_conversation_restore_email(email: str, team_id: int, restore_url: str) -> None:
+    """Send email with restore link to recover conversation tickets on a new device."""
+    if not is_email_available(with_absolute_urls=True):
+        logger.warning("Skipping conversation restore email: email service not available")
+        return
+
+    try:
+        team = Team.objects.get(pk=team_id)
+    except Team.DoesNotExist:
+        logger.warning(f"Skipping conversation restore email: team not found (team_id={team_id})")
+        return
+
+    campaign_key = f"conversation_restore_{team_id}_{email}_{timezone.now().timestamp()}"
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=campaign_key,
+        subject=f"Restore your conversations with {team.name}",
+        template_name="conversation_restore",
+        template_context={
+            "team_name": team.name,
+            "restore_url": restore_url,
+        },
+    )
+
+    message.add_recipient(email)
+    message.send()
+    logger.info(f"Sent conversation restore email to {email} for team {team.id}")
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_project_deleted_email(
+    user_id: int,
+    project_name: str,
+) -> None:
+    """Send email notification when project deletion is complete."""
+    user = User.objects.filter(id=user_id).first()
+    if not user:
+        logger.warning(f"User {user_id} not found for project deletion email")
+        return
+
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"project_deleted_{user_id}_{timezone.now().timestamp()}",
+        subject=f"Your project '{project_name}' has been deleted",
+        template_name="project_deleted",
+        template_context={
+            "project_name": project_name,
+            "site_url": settings.SITE_URL,
+        },
+    )
+    message.add_user_recipient(user)
+    message.send()
+    logger.info(f"Sent project deletion confirmation email to user {user_id} for project {project_name}")
+
+
+@shared_task(**EMAIL_TASK_KWARGS)
+def send_organization_deleted_email(
+    user_id: int,
+    organization_name: str,
+    project_names: list[str],
+) -> None:
+    """Send email notification when organization deletion is complete."""
+    user = User.objects.filter(id=user_id).first()
+    if not user:
+        logger.warning(f"User {user_id} not found for organization deletion email")
+        return
+
+    message = EmailMessage(
+        use_http=True,
+        campaign_key=f"organization_deleted_{user_id}_{timezone.now().timestamp()}",
+        subject=f"Your organization '{organization_name}' has been deleted",
+        template_name="organization_deleted",
+        template_context={
+            "organization_name": organization_name,
+            "project_names": project_names,
+            "site_url": settings.SITE_URL,
+        },
+    )
+    message.add_user_recipient(user)
+    message.send()
+    logger.info(f"Sent organization deletion confirmation email to user {user_id} for organization {organization_name}")
+
+
+@shared_task(ignore_result=True)
+def send_error_tracking_weekly_digest() -> None:
+    """
+    Send weekly digest email per organization
+    Queries ClickHouse for orgs with exceptions, then fans out per-org email tasks
+    """
+    from products.error_tracking.backend.weekly_digest import get_org_ids_with_exceptions
+
+    logger.info("Starting Error Tracking weekly digest task")
+
+    allowed_org_ids = settings.ERROR_TRACKING_WEEKLY_DIGEST_ORG_IDS
+    if not allowed_org_ids:
+        logger.info("No orgs configured for Error Tracking weekly digest (ERROR_TRACKING_WEEKLY_DIGEST_ORG_IDS empty)")
+        return
+
+    all_org_ids = get_org_ids_with_exceptions()
+
+    if "*" in allowed_org_ids:
+        org_ids = all_org_ids
+    else:
+        allowed_set = {str(oid) for oid in allowed_org_ids}
+        org_ids = [oid for oid in all_org_ids if str(oid) in allowed_set]
+
+    logger.info(f"Found {len(org_ids)} orgs with exceptions, fanning out digest emails")
+
+    for org_id in org_ids:
+        send_error_tracking_weekly_digest_for_org.delay(str(org_id))
+
+    logger.info("Completed Error Tracking weekly digest fan-out")
+
+
+@shared_task(**EMAIL_TASK_KWARGS, rate_limit="10/s")
+def send_error_tracking_weekly_digest_for_org(org_id: str) -> None:
+    """Send one combined weekly error tracking digest email per user in an org"""
+    from posthog.models.organization import Organization
+
+    from products.error_tracking.backend.weekly_digest import (
+        auto_select_project_for_user,
+        build_ingestion_failures_url,
+        compute_week_over_week_change,
+        get_crash_free_sessions,
+        get_daily_exception_counts,
+        get_exception_counts_for_org,
+        get_new_issues_for_team,
+        get_top_issues_for_team,
+    )
+
+    if not is_email_available(with_absolute_urls=True):
+        return
+
+    try:
+        org = Organization.objects.get(id=org_id)
+    except Organization.DoesNotExist:
+        logger.warning(f"Organization {org_id} not found for Error Tracking weekly digest")
+        return
+
+    team_exception_counts = get_exception_counts_for_org(org.id)
+    if not team_exception_counts:
+        return
+
+    all_org_teams = {t.id: t for t in Team.objects.filter(organization_id=org.id)}
+    excluded_project_count = len(all_org_teams) - len(team_exception_counts)
+
+    # Pre-compute per-team digest data only for teams that have exceptions
+    team_digest_data: dict[int, dict] = {}
+    for team_id, counts in team_exception_counts.items():
+        team = all_org_teams.get(team_id)
+        if not team:
+            continue
+
+        team_digest_data[team_id] = {
+            "team": team,
+            "exception_count": counts["exception_count"],
+            "exception_change": compute_week_over_week_change(
+                counts["exception_count"], counts["prev_exception_count"], higher_is_better=False
+            ),
+            "ingestion_failure_count": counts["ingestion_failure_count"],
+            "top_issues": get_top_issues_for_team(team),
+            "new_issues": get_new_issues_for_team(team),
+            "daily_counts": get_daily_exception_counts(team_id),
+            "crash_free": get_crash_free_sessions(team),
+            "error_tracking_url": f"{settings.SITE_URL}/project/{team_id}/error_tracking?utm_source=error_tracking_weekly_digest",
+            "ingestion_failures_url": build_ingestion_failures_url(team_id),
+        }
+
+    all_memberships = OrganizationMembership.objects.prefetch_related("user").filter(organization_id=org.id)
+
+    allowed_emails = settings.ERROR_TRACKING_WEEKLY_DIGEST_ALLOWED_EMAILS
+    if not allowed_emails:
+        logger.info(f"No allowed emails configured, skipping org {org_id}")
+        return
+    memberships: list[OrganizationMembership] = (
+        [m for m in all_memberships if m.user.email in allowed_emails]
+        if "*" not in allowed_emails
+        else list(all_memberships)
+    )
+
+    date_suffix = timezone.now().strftime("%Y-%W")
+    sent_count = 0
+
+    for membership in memberships:
+        user = membership.user
+
+        if not should_send_notification(user, NotificationSetting.ERROR_TRACKING_WEEKLY_DIGEST.value):
+            continue
+
+        # Auto-select busiest project for first-time users
+        auto_select_project_for_user(user, org.id, team_exception_counts)
+        user.refresh_from_db(fields=["partial_notification_settings"])
+
+        # Build per-user list of enabled teams
+        user_team_sections = []
+        disabled_team_names = []
+        for team_id, data in team_digest_data.items():
+            team = data["team"]
+            user_permissions = UserPermissions(user).team(team)
+            if user_permissions.effective_membership_level_for_parent_membership(org, membership) is None:
+                continue
+
+            if should_send_notification(user, NotificationSetting.ERROR_TRACKING_WEEKLY_DIGEST.value, team_id):
+                user_team_sections.append(data)
+            else:
+                disabled_team_names.append(team.name)
+
+        if not user_team_sections:
+            continue
+
+        user_team_sections.sort(key=lambda d: d["exception_count"], reverse=True)
+
+        campaign_key = f"error_tracking_weekly_digest_{org_id}_{user.uuid}_{date_suffix}"
+        message = EmailMessage(
+            campaign_key=campaign_key,
+            subject=f"Error tracking weekly digest for {org.name}",
+            template_name="error_tracking_weekly_digest",
+            template_context={
+                "organization": org,
+                "project_sections": user_team_sections,
+                "disabled_project_names": disabled_team_names,
+                "excluded_project_count": excluded_project_count,
+                "settings_url": f"{settings.SITE_URL}/settings/user-notifications?highlight=et-weekly-digest",
+                "contact_support_url": "https://posthog.com/support",
+                "feedback_survey_url": f"https://us.posthog.com/external_surveys/019c7fd6-7cfa-0000-2b03-a8e5d4c03743?distinct_id={user.distinct_id}",
+            },
+        )
+        message.add_user_recipient(user)
+        message.send()
+        sent_count += 1
+
+    logger.info(
+        f"Sent Error Tracking weekly digest to {sent_count} members for org {org_id} "
+        f"({len(team_digest_data)} teams with exceptions)"
+    )

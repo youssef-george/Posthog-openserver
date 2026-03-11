@@ -1,0 +1,510 @@
+import { actions, afterMount, connect, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+import { router } from 'kea-router'
+
+import { FEATURE_FLAGS } from 'lib/constants'
+import { LemonTag } from 'lib/lemon-ui/LemonTag/LemonTag'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { identifierToHuman } from 'lib/utils'
+import { insightDataLogic } from 'scenes/insights/insightDataLogic'
+import { keyForInsightLogicProps } from 'scenes/insights/sharedUtils'
+import { filterTestAccountsDefaultsLogic } from 'scenes/settings/environment/filterTestAccountDefaultsLogic'
+import { urls } from 'scenes/urls'
+
+import { expandGroupNodes } from '~/queries/nodes/InsightQuery/utils/filtersToQueryNode'
+import { nodeKindToInsightType } from '~/queries/nodes/InsightQuery/utils/queryNodeToFilter'
+import { getDefaultQuery } from '~/queries/nodes/InsightViz/utils'
+import {
+    AnyEntityNode,
+    CalendarHeatmapFilter,
+    FunnelsFilter,
+    FunnelsQuery,
+    GroupNode,
+    InsightQueryNode,
+    InsightVizNode,
+    LifecycleFilter,
+    LifecycleQuery,
+    PathsFilter,
+    PathsQuery,
+    RetentionFilter,
+    RetentionQuery,
+    StickinessFilter,
+    StickinessQuery,
+    TrendsFilter,
+    TrendsQuery,
+} from '~/queries/schema/schema-general'
+import {
+    containsHogQLQuery,
+    getResultCustomizations,
+    filterForQuery,
+    isDataTableNode,
+    isDataVisualizationNode,
+    isEndpointsUsageQuery,
+    isFunnelsQuery,
+    isHogQuery,
+    isInsightQueryWithBreakdown,
+    isInsightQueryWithSeries,
+    isInsightVizNode,
+    isLifecycleQuery,
+    isPathsQuery,
+    isRetentionQuery,
+    isStickinessQuery,
+    isTrendsQuery,
+    isWebAnalyticsInsightQuery,
+} from '~/queries/utils'
+import { BaseMathType, InsightLogicProps, InsightType } from '~/types'
+
+import { MathAvailability } from '../filters/ActionFilter/ActionFilterRow/ActionFilterRow'
+import type { insightNavLogicType } from './insightNavLogicType'
+
+export interface Tab {
+    label: string | JSX.Element
+    type: InsightType
+    dataAttr: string
+}
+
+type OmitConflictingProperties<T> = Omit<T, 'resultCustomizations'>
+
+export interface CommonInsightFilter
+    extends
+        Partial<OmitConflictingProperties<TrendsFilter>>,
+        Partial<OmitConflictingProperties<FunnelsFilter>>,
+        Partial<RetentionFilter>,
+        Partial<PathsFilter>,
+        Partial<StickinessFilter>,
+        Partial<LifecycleFilter> {}
+
+export interface QueryPropertyCache
+    extends
+        Omit<Partial<TrendsQuery>, 'kind' | 'response' | 'series'>,
+        Omit<Partial<FunnelsQuery>, 'kind' | 'response' | 'series'>,
+        Omit<Partial<RetentionQuery>, 'kind' | 'response' | 'series'>,
+        Omit<Partial<PathsQuery>, 'kind' | 'response'>,
+        Omit<Partial<StickinessQuery>, 'kind' | 'response' | 'series'>,
+        Omit<Partial<LifecycleQuery>, 'kind' | 'response' | 'series'> {
+    series?: (AnyEntityNode | GroupNode)[]
+    commonFilter: CommonInsightFilter
+    commonFilterTrendsStickiness?: {
+        resultCustomizations?: Record<string, any>
+    }
+    trendsFilter?: Partial<TrendsQuery['trendsFilter']>
+    calendarHeatmapFilter?: Partial<CalendarHeatmapFilter>
+}
+
+const cleanSeriesEntityMath = (
+    entity: AnyEntityNode | GroupNode,
+    mathAvailability: MathAvailability
+): AnyEntityNode | GroupNode => {
+    const { math, math_property, math_group_type_index, math_hogql, ...baseEntity } = entity
+
+    // Recursively clean nested nodes in GroupNode
+    if ('nodes' in baseEntity && Array.isArray(baseEntity.nodes)) {
+        baseEntity.nodes = baseEntity.nodes.map(
+            (node) => cleanSeriesEntityMath(node, mathAvailability) as AnyEntityNode
+        )
+    }
+
+    // TODO: This should be improved to keep a math that differs from the default.
+    // For this we need to know wether the math was actively changed e.g.
+    // On which insight type the math properties have been set.
+    if (mathAvailability === MathAvailability.All) {
+        // return entity with default all availability math set
+        return { ...baseEntity, math: BaseMathType.TotalCount }
+    } else if (mathAvailability === MathAvailability.ActorsOnly) {
+        // return entity with default actors only availability math set
+        return { ...baseEntity, math: BaseMathType.UniqueUsers }
+    }
+    // return entity without math properties for insights that don't support it
+    return baseEntity
+}
+
+const cleanSeriesMath = (
+    series: (AnyEntityNode | GroupNode)[],
+    mathAvailability: MathAvailability
+): (AnyEntityNode | GroupNode)[] => {
+    return series.map((entity) => cleanSeriesEntityMath(entity, mathAvailability))
+}
+
+export const insightNavLogic = kea<insightNavLogicType>([
+    props({} as InsightLogicProps),
+    key(keyForInsightLogicProps('new')),
+    path((key) => ['scenes', 'insights', 'InsightNav', 'insightNavLogic', key]),
+    connect((props: InsightLogicProps) => ({
+        values: [
+            featureFlagLogic,
+            ['featureFlags'],
+            insightDataLogic(props),
+            ['query'],
+            filterTestAccountsDefaultsLogic,
+            ['filterTestAccountsDefault'],
+        ],
+        actions: [insightDataLogic(props), ['setQuery']],
+    })),
+    actions({
+        setActiveView: (view: InsightType) => ({ view }),
+        updateQueryPropertyCache: (cache: QueryPropertyCache) => ({ cache }),
+    }),
+    reducers({
+        queryPropertyCache: [
+            null as QueryPropertyCache | null,
+            {
+                updateQueryPropertyCache: (state, { cache }) => ({
+                    ...state,
+                    ...cache,
+                }),
+            },
+        ],
+    }),
+    selectors({
+        activeView: [
+            (s) => [s.query],
+            (query) => {
+                if (isDataTableNode(query)) {
+                    return InsightType.JSON
+                } else if (containsHogQLQuery(query)) {
+                    return InsightType.SQL
+                } else if (isHogQuery(query)) {
+                    return InsightType.HOG
+                } else if (isInsightVizNode(query)) {
+                    // Check for Web Analytics queries first before using the mapping
+                    if (isWebAnalyticsInsightQuery(query.source)) {
+                        return InsightType.WEB_ANALYTICS
+                    }
+                    return nodeKindToInsightType[query.source.kind] || InsightType.TRENDS
+                }
+                return InsightType.JSON
+            },
+        ],
+        tabs: [
+            (s) => [s.activeView, s.query, s.featureFlags],
+            (activeView, query, featureFlags) => {
+                const tabs: Tab[] = [
+                    {
+                        label: 'Trends',
+                        type: InsightType.TRENDS,
+                        dataAttr: 'insight-trends-tab',
+                    },
+                    {
+                        label: 'Funnels',
+                        type: InsightType.FUNNELS,
+                        dataAttr: 'insight-funnels-tab',
+                    },
+                    {
+                        label: 'Retention',
+                        type: InsightType.RETENTION,
+                        dataAttr: 'insight-retention-tab',
+                    },
+                    {
+                        label: 'User Paths',
+                        type: InsightType.PATHS,
+                        dataAttr: 'insight-path-tab',
+                    },
+                    {
+                        label: 'Stickiness',
+                        type: InsightType.STICKINESS,
+                        dataAttr: 'insight-stickiness-tab',
+                    },
+                    {
+                        label: 'Lifecycle',
+                        type: InsightType.LIFECYCLE,
+                        dataAttr: 'insight-lifecycle-tab',
+                    },
+                ]
+
+                if (featureFlags[FEATURE_FLAGS.HOG] || activeView === InsightType.HOG) {
+                    tabs.push({
+                        label: <>Hog 🦔</>,
+                        type: InsightType.HOG,
+                        dataAttr: 'insight-hog-tab',
+                    })
+                }
+
+                if (activeView === InsightType.WEB_ANALYTICS) {
+                    // Like the json only, this is a temporary tab for Web Analytics insights.
+                    // We don't display it otherwise and humans shouldn't be able to click to select this tab
+                    // it only opens when you select "Open as new insight" from the Web Analytics dashboard.
+                    tabs.push({
+                        label: (
+                            <>
+                                Web Analytics{' '}
+                                <LemonTag type="warning" className="uppercase ml-2">
+                                    Beta
+                                </LemonTag>
+                            </>
+                        ),
+                        type: InsightType.WEB_ANALYTICS,
+                        dataAttr: 'insight-web-analytics-tab',
+                    })
+                }
+
+                if (activeView === InsightType.JSON && !isEndpointsUsageQuery(query)) {
+                    // only display this tab when it is selected by the provided insight query
+                    // don't display it otherwise... humans shouldn't be able to click to select this tab
+                    // it only opens when you click the <OpenEditorButton/>
+                    // EndpointsUsage queries should not appear in the insight editor at all
+                    const humanFriendlyQueryKind: string | null =
+                        typeof query?.kind === 'string'
+                            ? identifierToHuman(query.kind.replace(/(Node|Query)$/g, ''), 'title')
+                            : null
+                    tabs.push({
+                        label: (
+                            <>
+                                {humanFriendlyQueryKind ?? 'Custom'}{' '}
+                                <LemonTag type="warning" className="uppercase ml-2">
+                                    Beta
+                                </LemonTag>
+                            </>
+                        ),
+                        type: InsightType.JSON,
+                        dataAttr: 'insight-json-tab',
+                    })
+                }
+
+                return tabs
+            },
+        ],
+    }),
+    listeners(({ values, actions }) => ({
+        setActiveView: ({ view }) => {
+            const query = getDefaultQuery(view, values.filterTestAccountsDefault)
+
+            if (isDataVisualizationNode(query)) {
+                router.actions.push(urls.sqlEditor({ query: query.source.query }))
+            } else if (isInsightVizNode(query)) {
+                actions.setQuery({
+                    ...query,
+                    source: values.queryPropertyCache
+                        ? mergeCachedProperties(query.source, values.queryPropertyCache, values.featureFlags)
+                        : query.source,
+                } as InsightVizNode)
+            } else {
+                actions.setQuery(query)
+            }
+        },
+        setQuery: ({ query }) => {
+            if (isInsightVizNode(query)) {
+                actions.updateQueryPropertyCache(cachePropertiesFromQuery(query.source, values.queryPropertyCache))
+            }
+        },
+    })),
+    afterMount(({ values, actions }) => {
+        if (values.query && isInsightVizNode(values.query)) {
+            actions.updateQueryPropertyCache(cachePropertiesFromQuery(values.query.source, values.queryPropertyCache))
+        }
+    }),
+])
+
+const cachePropertiesFromQuery = (query: InsightQueryNode, cache: QueryPropertyCache | null): QueryPropertyCache => {
+    const newCache = JSON.parse(JSON.stringify(query)) as QueryPropertyCache
+
+    if (isLifecycleQuery(query)) {
+        newCache.series = cache?.series
+    }
+
+    if (isWebAnalyticsInsightQuery(query)) {
+        return newCache
+    }
+
+    /** store the insight specific filter in commonFilter */
+    const insightFilter = filterForQuery(query)
+    const resultCustomizations = getResultCustomizations(query)
+    // exclude properties that shouldn't be shared
+    let commonProperties = insightFilter || {}
+    if (isTrendsQuery(query)) {
+        const { resultCustomizations: _resultCustomizations, ...trendsCommonProperties } = query.trendsFilter || {}
+        commonProperties = trendsCommonProperties
+    } else if (isStickinessQuery(query)) {
+        const { resultCustomizations: _resultCustomizations, ...stickinessCommonProperties } =
+            query.stickinessFilter || {}
+        commonProperties = stickinessCommonProperties
+    } else if (isFunnelsQuery(query)) {
+        const { resultCustomizations: _resultCustomizations, ...funnelsCommonProperties } = query.funnelsFilter || {}
+        commonProperties = funnelsCommonProperties
+    }
+    newCache.commonFilter = { ...cache?.commonFilter, ...commonProperties }
+
+    /** store the insight specific filter for trend and stickiness queries */
+    if (isTrendsQuery(query) || isStickinessQuery(query)) {
+        newCache.commonFilterTrendsStickiness = {
+            ...cache?.commonFilterTrendsStickiness,
+            ...(resultCustomizations !== undefined ? { resultCustomizations } : {}),
+        }
+    }
+
+    return newCache
+}
+
+const mergeCachedProperties = (
+    query: InsightQueryNode,
+    cache: QueryPropertyCache,
+    featureFlags: Record<string, boolean | string | undefined>
+): InsightQueryNode => {
+    const mergedQuery = {
+        ...query,
+        ...(cache.dateRange ? { dateRange: cache.dateRange } : {}),
+        ...(cache.properties ? { properties: cache.properties } : {}),
+        ...(cache.samplingFactor ? { samplingFactor: cache.samplingFactor } : {}),
+    }
+
+    // series
+    if (isInsightQueryWithSeries(mergedQuery)) {
+        if (cache.series) {
+            if (isTrendsQuery(mergedQuery)) {
+                // Trends supports GroupNode, keep series as-is
+                mergedQuery.series = cleanSeriesMath(cache.series, MathAvailability.All) as TrendsQuery['series']
+            } else if (isFunnelsQuery(mergedQuery)) {
+                // Funnels supports GroupNode behind a feature flag, keep series as-is when the flag is enabled
+                const supportsCombinedEvents =
+                    !!featureFlags[FEATURE_FLAGS.PRODUCT_ANALYTICS_EVENTS_COMBINATION_IN_FUNNELS]
+                mergedQuery.series = cleanSeriesMath(
+                    supportsCombinedEvents ? cache.series : expandGroupNodes(cache.series),
+                    MathAvailability.FunnelsOnly
+                ) as FunnelsQuery['series']
+            } else {
+                // Expand GroupNodes for insight types that don't support them
+                const expandedSeries = expandGroupNodes(cache.series)
+
+                if (isLifecycleQuery(mergedQuery)) {
+                    mergedQuery.series = cleanSeriesMath(
+                        expandedSeries.slice(0, 1),
+                        MathAvailability.None
+                    ) as LifecycleQuery['series']
+                } else {
+                    const mathAvailability = isStickinessQuery(mergedQuery)
+                        ? MathAvailability.ActorsOnly
+                        : MathAvailability.None
+                    mergedQuery.series = cleanSeriesMath(expandedSeries, mathAvailability) as typeof mergedQuery.series
+                }
+            }
+        }
+        // else if (cache.retentionFilter?.targetEntity || cache.retentionFilter?.returningEntity) {
+        //     mergedQuery.series = [
+        //         ...(cache.retentionFilter.targetEntity
+        //             ? [cache.retentionFilter.targetEntity as EventsNode | ActionsNode]
+        //             : []),
+        //         ...(cache.retentionFilter.returningEntity
+        //             ? [cache.retentionFilter.returningEntity as EventsNode | ActionsNode]
+        //             : []),
+        //     ]
+        // }
+    } else if (isRetentionQuery(mergedQuery) && cache.series) {
+        // mergedQuery.retentionFilter = {
+        //     ...mergedQuery.retentionFilter,
+        //     ...(cache.series.length > 0 ? { targetEntity: cache.series[0] } : {}),
+        //     ...(cache.series.length > 1 ? { returningEntity: cache.series[1] } : {}),
+        // }
+    }
+
+    // interval
+    if (isInsightQueryWithSeries(mergedQuery) && cache.interval) {
+        // Only support real time queries on trends for now
+        if (!isTrendsQuery(mergedQuery) && cache.interval == 'minute') {
+            mergedQuery.interval = 'hour'
+        } else {
+            mergedQuery.interval = cache.interval
+        }
+    }
+
+    // breakdown filter
+    if (isInsightQueryWithBreakdown(mergedQuery) && cache.breakdownFilter) {
+        mergedQuery.breakdownFilter = cache.breakdownFilter
+
+        // If we've changed the query kind, convert multiple breakdowns to a single breakdown
+        if (isTrendsQuery(cache) && isFunnelsQuery(query)) {
+            if (cache.breakdownFilter.breakdowns?.length) {
+                const firstBreakdown = cache.breakdownFilter?.breakdowns?.[0]
+                mergedQuery.breakdownFilter = {
+                    ...cache.breakdownFilter,
+                    breakdowns: undefined,
+                    breakdown: firstBreakdown?.property,
+                    breakdown_type: firstBreakdown?.type,
+                    breakdown_histogram_bin_count: firstBreakdown?.histogram_bin_count,
+                    breakdown_group_type_index: firstBreakdown?.group_type_index,
+                    breakdown_normalize_url: firstBreakdown?.normalize_url,
+                }
+            } else {
+                mergedQuery.breakdownFilter = {
+                    ...cache.breakdownFilter,
+                    breakdowns: undefined,
+                }
+            }
+        }
+
+        if (isRetentionQuery(query) && cache.breakdownFilter?.breakdowns) {
+            mergedQuery.breakdownFilter = {
+                ...query.breakdownFilter,
+                breakdowns: cache.breakdownFilter.breakdowns.filter((b) => b.type === 'person' || b.type === 'event'),
+            }
+        }
+    }
+
+    // funnel paths filter
+    if (isPathsQuery(mergedQuery) && cache.funnelPathsFilter) {
+        mergedQuery.funnelPathsFilter = cache.funnelPathsFilter
+    }
+
+    if (isWebAnalyticsInsightQuery(mergedQuery as InsightQueryNode)) {
+        return mergedQuery as InsightQueryNode
+    }
+
+    // insight specific filter
+    if (cache.commonFilter) {
+        const commonVisualizationProperties = {
+            // TODO: fix an issue where switching between trends and funnels with the option enabled would
+            // result in an error before uncommenting
+            // ...(cache.commonFilter?.compare ? { compare: cache.commonFilter.compare } : {}),
+            ...(cache.commonFilter?.showValuesOnSeries
+                ? { showValuesOnSeries: cache.commonFilter.showValuesOnSeries }
+                : {}),
+            ...(cache.commonFilter?.showPercentStackView
+                ? { showPercentStackView: cache.commonFilter.showPercentStackView }
+                : {}),
+            ...(cache.commonFilter?.display ? { display: cache.commonFilter.display } : {}),
+        }
+
+        if (isTrendsQuery(query) && isTrendsQuery(mergedQuery)) {
+            mergedQuery.trendsFilter = {
+                ...query.trendsFilter,
+                ...cache.trendsFilter,
+                ...commonVisualizationProperties,
+                ...(cache.commonFilterTrendsStickiness?.resultCustomizations
+                    ? { resultCustomizations: cache.commonFilterTrendsStickiness.resultCustomizations }
+                    : {}),
+            }
+        } else if (isStickinessQuery(query) && isStickinessQuery(mergedQuery)) {
+            mergedQuery.stickinessFilter = {
+                ...query.stickinessFilter,
+                ...cache.stickinessFilter,
+                ...commonVisualizationProperties,
+                ...(cache.commonFilterTrendsStickiness?.resultCustomizations
+                    ? { resultCustomizations: cache.commonFilterTrendsStickiness.resultCustomizations }
+                    : {}),
+            }
+        } else if (isFunnelsQuery(query) && isFunnelsQuery(mergedQuery)) {
+            mergedQuery.funnelsFilter = {
+                ...query.funnelsFilter,
+                ...cache.funnelsFilter,
+                ...commonVisualizationProperties,
+            }
+        } else if (isRetentionQuery(query) && isRetentionQuery(mergedQuery)) {
+            mergedQuery.retentionFilter = {
+                ...query.retentionFilter,
+                ...cache.retentionFilter,
+                ...commonVisualizationProperties,
+            }
+        } else if (isPathsQuery(query) && isPathsQuery(mergedQuery)) {
+            mergedQuery.pathsFilter = {
+                ...query.pathsFilter,
+                ...cache.pathsFilter,
+                ...commonVisualizationProperties,
+            }
+        } else if (isLifecycleQuery(query) && isLifecycleQuery(mergedQuery)) {
+            mergedQuery.lifecycleFilter = {
+                ...query.lifecycleFilter,
+                ...cache.lifecycleFilter,
+                ...commonVisualizationProperties,
+            }
+        }
+    }
+
+    return mergedQuery as InsightQueryNode
+}
