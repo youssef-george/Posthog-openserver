@@ -2,6 +2,28 @@
 
 This repo is wired for [Coolify](https://coolify.io) (or any Docker Compose host) with the hobby stack.
 
+---
+
+## ⚠️ Deployment failed with Nixpacks / "Application" build?
+
+Coolify **must** use the **Docker Compose** build pack for this repo, **not** the default Application (Nixpacks) build.
+
+- **Symptom**: Build fails with `COPY .nixpacks/nixpkgs-...nix not found` or "Found application type: node" — Coolify is trying to build a single Node app with Nixpacks.
+- **Fix**: Create a **Docker Compose** resource (or change the existing resource to use the Docker Compose build pack).
+
+### Steps in Coolify
+
+1. **Create New Resource** → choose **Public Repository** (or your Git method) → paste `https://github.com/youssef-george/Posthog-openserver.git`.
+2. **Build pack**: Open the build pack dropdown (it may say "Nixpacks") and select **Docker Compose**.
+3. **Docker Compose Location**: `docker-compose.coolify.yml`
+4. **Base Directory**: `/` (repo root).
+5. **Branch**: `main`.
+6. Continue, set env vars (see below), then deploy.
+
+If you already created an "Application" resource: edit it → find the **Build Pack** setting → switch from Nixpacks to **Docker Compose**, set the compose path to `docker-compose.coolify.yml`, then redeploy.
+
+---
+
 ## 1. Link repo and push
 
 ```powershell
