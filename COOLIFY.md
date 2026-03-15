@@ -24,6 +24,26 @@ If you already created an "Application" resource: edit it → find the **Build P
 
 ---
 
+## ⚠️ Deployment failed with "Argument list too long" / `posix_spawn() failed`?
+
+**Symptom**: Deployment fails with:
+
+```text
+Error: proc_open(): posix_spawn() failed: Argument list too long
+```
+
+**Cause**: Coolify injects the merged Docker Compose (with all services and env) into the deploy command as arguments. This repo’s compose is large, so the total argument length exceeds the OS limit (e.g. `ARG_MAX`), and the spawn fails.
+
+**What you can do**:
+
+1. **Report to Coolify**: This is a Coolify limitation. Ask them to avoid passing the full compose as command-line arguments (e.g. write the compose to a temp file or stream via stdin, then run a short command that reads from that file). Include the error and that you use `docker-compose.coolify.yml` with many services.
+2. **Upgrade Coolify**: Newer versions may fix this; check [Coolify releases](https://github.com/coollabsio/coolify/releases) and changelog.
+3. **Self-host on the same server**: If you run Coolify on the same machine as the deployment target, some setups use a shorter code path that might avoid the long command line (no guarantee).
+
+There is no change in this repo that can fix the limit; the compose size is required for the hobby stack.
+
+---
+
 ## 1. Link repo and push
 
 ```powershell
